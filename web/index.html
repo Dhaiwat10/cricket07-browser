@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recompiled game</title>
+<style>
+  :root { --bg: #0b0f0c; --fg: #e8efe9; --muted: #9db0a2; --accent: #2f9e57; --panel: #141b16; --line: #26332a; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f3f6f4; --fg: #13201a; --muted: #4d6355; --panel: #ffffff; --line: #d3ddd6; } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { min-height: 100%; display: grid; place-items: center; padding: 16px; box-sizing: border-box; }
+  #stage { position: relative; width: min(100%, calc((100vh - 32px) * 4 / 3)); aspect-ratio: 4 / 3; background: #000; border-radius: 6px; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; cursor: none; }
+  #panel { position: absolute; inset: 0; display: grid; place-items: center; background: var(--panel); text-align: center; padding: 24px; box-sizing: border-box; }
+  #panel h1 { margin: 0 0 8px; font-size: 22px; }
+  #panel p { margin: 6px 0; color: var(--muted); max-width: 46ch; }
+  button, label.button { display: inline-block; margin-top: 14px; padding: 10px 18px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  progress { width: 280px; margin-top: 14px; }
+  #status { font-variant-numeric: tabular-nums; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <div id="stage">
+    <canvas id="canvas" width="1024" height="768" tabindex="0"></canvas>
+    <div id="panel">
+      <div>
+        <h1>Recompiled game</h1>
+        <p id="status">Checking your browser…</p>
+        <progress id="progress" class="hidden" max="1" value="0"></progress>
+        <div>
+          <label id="pick" class="button hidden">Choose game folder
+            <input id="folder" type="file" webkitdirectory multiple hidden>
+          </label>
+          <button id="play" class="hidden">Play</button>
+          <button id="reset" class="hidden secondary">Use a different folder</button>
+        </div>
+        <p id="help" class="hidden">Pick your installed game's folder (the one holding its executable). It is copied
+          into this browser's private storage once and never leaves your computer.</p>
+      </div>
+    </div>
+  </div>
+</main>
+<script src="loader.js"></script>
+</body>
+</html>
