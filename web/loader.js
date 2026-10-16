@@ -180,9 +180,9 @@ async function boot() {
     $('help').classList.remove('hidden');
   };
 
-  $('reset').onclick = () => showPicker('Choose your game folder.');
+  $('reset').onclick = () => showPicker('Choose your Cricket 07 folder.');
   if (!(await readMarker())) {
-    showPicker('Choose your game folder to start.');
+    showPicker('Choose your Cricket 07 folder to start.');
     return;
   }
   $('reset').classList.remove('hidden');
