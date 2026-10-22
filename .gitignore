@@ -1,0 +1,20 @@
+# Build outputs: generated C and binaries are derived from the game you build, never commit them
+out_all/
+out_trace/
+build/
+build_web/
+tests/results/
+third_party/
+userdata/
+.venv/
+__pycache__/
+# Game files and anything exported from them
+*.exe
+*.dll
+functions.json
+ghidra_project/
+*.csv
+.dev.vars
+.wrangler/
+node_modules/
+.claude/

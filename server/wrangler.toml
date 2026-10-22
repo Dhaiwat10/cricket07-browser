@@ -1,0 +1,16 @@
+# Netplay room server (see worker.js and README.md in this folder).
+name = "cricket07-netplay"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+ALLOWED_ORIGINS = "*"   # comma-separated origins allowed to fetch tickets, e.g. "http://localhost:8007"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "NetplayRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NetplayRoom"]
