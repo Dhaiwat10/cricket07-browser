@@ -390,12 +390,21 @@ function setupFullscreen() {
   const active = () => document.fullscreenElement || document.webkitFullscreenElement;
   const toggle = () => {
     if (active()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-    else (stage.requestFullscreen || stage.webkitRequestFullscreen).call(stage)?.catch?.(() => {});
+    else {
+      // Keyboard Lock lets Escape reach the game instead of triggering the browser's fullscreen exit.
+      // The option is ignored by browsers that don't support it; the key handler below still calls
+      // preventDefault, and the separate lock call covers implementations exposing the Keyboard API.
+      const request = stage.requestFullscreen || stage.webkitRequestFullscreen;
+      try {
+        request.call(stage, { keyboardLock: 'browser' })?.catch?.(() => {});
+      } catch { request.call(stage)?.catch?.(() => {}); }
+    }
     $('canvas').focus();
   };
   if (!stage.requestFullscreen && !stage.webkitRequestFullscreen) { $('fs').classList.add('hidden'); return; }
   $('fs').onclick = toggle;
   const swallow = (e) => {
+    if (e.code === 'Escape' && active()) e.preventDefault();
     if (e.code !== 'Enter' && e.code !== 'NumpadEnter') return;
     if (!e.altKey) return;
     e.preventDefault();
@@ -405,8 +414,10 @@ function setupFullscreen() {
   window.addEventListener('keydown', swallow, true);
   window.addEventListener('keyup', swallow, true);
   const sync = () => {
+    if (active()) navigator.keyboard?.lock?.(['Escape']).catch?.(() => {});
+    else navigator.keyboard?.unlock?.();
     $('fs-icon').setAttribute('d', active() ? 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5' : 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5');
-    $('fs').title = active() ? 'Exit fullscreen (Alt+Enter or Esc)' : 'Fullscreen (Alt+Enter)';
+    $('fs').title = active() ? 'Exit fullscreen (Alt+Enter or hold Esc)' : 'Fullscreen (Alt+Enter)';
   };
   document.addEventListener('fullscreenchange', sync);
   document.addEventListener('webkitfullscreenchange', sync);
