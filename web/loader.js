@@ -126,10 +126,13 @@ function hookInput(M, net) {
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     return;
   }
+  const heldKeys = new Set();
+  const heldMouseButtons = new Set();
   const key = (down) => (e) => {
     const u = HID[e.code];
     if (u === undefined || e.repeat) return;
     if (!(e.metaKey && !down)) e.preventDefault();
+    if (down) heldKeys.add(u); else heldKeys.delete(u);
     M._input_key_hid(u, down ? 1 : 0);
   };
   window.addEventListener('keydown', key(true));
@@ -141,9 +144,25 @@ function hookInput(M, net) {
       const p = canvas.requestPointerLock?.();
       if (p && p.catch) p.catch(() => {});
     }
-    M._input_mouse_button([0, 2, 1][e.button] ?? 0, 1);
+    const button = [0, 2, 1][e.button];
+    if (button === undefined) return;
+    heldMouseButtons.add(button);
+    M._input_mouse_button(button, 1);
   });
-  window.addEventListener('mouseup', (e) => M._input_mouse_button([0, 2, 1][e.button] ?? 0, 0));
+  window.addEventListener('mouseup', (e) => {
+    const button = [0, 2, 1][e.button];
+    if (button === undefined) return;
+    heldMouseButtons.delete(button);
+    M._input_mouse_button(button, 0);
+  });
+  // Key/button releases outside the window may never arrive. Clear the game's held input
+  // when switching apps or tabs so movement and mouse actions cannot remain stuck.
+  window.addEventListener('blur', () => {
+    for (const u of heldKeys) M._input_key_hid(u, 0);
+    for (const button of heldMouseButtons) M._input_mouse_button(button, 0);
+    heldKeys.clear();
+    heldMouseButtons.clear();
+  });
   canvas.addEventListener('mousemove', (e) => M._input_mouse_move(e.movementX, e.movementY));
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 }
