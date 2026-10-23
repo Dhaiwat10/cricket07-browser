@@ -114,6 +114,7 @@ export class NetplayRoom {
   async webSocketMessage(ws, data) {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
     const me = ws.deserializeAttachment();
     if (msg.t === 'hello' && me.slot < 0) {
       if (await this.ctx.storage.get('started')) { this.send(ws, { t: 'error', msg: 'This game has already started.' }); ws.close(4000, 'started'); return; }
@@ -121,16 +122,23 @@ export class NetplayRoom {
       let slot = 0;
       while (used.has(slot)) slot++;
       if (slot >= MAX_PLAYERS) { this.send(ws, { t: 'error', msg: 'The room is full.' }); ws.close(4001, 'full'); return; }
-      ws.serializeAttachment({ ...me, slot, name: String(msg.name || `Player ${slot + 1}`).slice(0, 24), version: String(msg.version || ''), rtt: 0 });
+      // The ticket admits a connection to the server; only this private token owns its slot.
+      // Keep it in the attachment (and away storage) so it survives object hibernation.
+      const token = crypto.randomUUID();
+      ws.serializeAttachment({ ...me, slot, token, name: String(msg.name || `Player ${slot + 1}`).slice(0, 24), version: String(msg.version || ''), rtt: 0 });
+      this.send(ws, { t: 'joined', token });
       await this.lobby();
       return;
     }
     if (msg.t === 'ping') { this.send(ws, { t: 'pong', ts: msg.ts }); return; }
     if (msg.t === 'rejoin' && me.slot < 0) {   // a player of a running game whose connection dropped
       const started = await this.ctx.storage.get('started');
-      const slot = Number(msg.slot);
+      const slot = msg.slot;
       const away = (await this.ctx.storage.get('away')) || {};
-      if (!started || !(slot in away) || this.peers().some((p) => p.slot === slot)) {
+      if (!started || !Number.isInteger(slot) || slot < 0 || slot >= MAX_PLAYERS ||
+          !Object.hasOwn(away, slot) || Date.now() - away[slot].at >= REJOIN_GRACE_MS ||
+          typeof msg.token !== 'string' || !away[slot].token || !timingSafeEqual(msg.token, away[slot].token) ||
+          this.peers().some((p) => p.slot === slot)) {
         this.send(ws, { t: 'error', msg: 'Could not rejoin the game.' }); ws.close(4002, 'rejoin'); return;
       }
       ws.serializeAttachment({ ...away[slot], slot });
@@ -167,8 +175,14 @@ export class NetplayRoom {
       if (!(await this.ctx.storage.get('started'))) await this.lobby();
       return;
     }
-    if (msg.t === 'in') {   // relay as-is to everyone else
-      for (const p of this.peers()) if (p.slot !== me.slot) try { p.ws.send(data); } catch { /* closed */ }
+    if (msg.t === 'in') {
+      // A peer may only publish its own inputs and hashes. Reject the entire batch if any
+      // entry claims another slot; clients apply the same rule on direct WebRTC channels.
+      const valid = (rows, size) => Array.isArray(rows) && rows.every((row) =>
+        Array.isArray(row) && row.length === size && row[0] === me.slot && row.every(Number.isInteger));
+      const d = msg.d ?? [], h = msg.h ?? [];
+      if (!valid(d, 8) || !valid(h, 4)) return;
+      for (const p of this.peers()) if (p.slot !== me.slot) this.send(p.ws, { t: 'in', d, h });
     }
   }
 

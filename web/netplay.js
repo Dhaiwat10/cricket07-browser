@@ -47,6 +47,7 @@
     let game = null;          // the Emscripten module once attached
     let timer = null;
     let me = -1;
+    let rejoinToken = '';
     const early = [];         // input batches that arrive before the game is attached
     const roomTrip = trip();
     let rtt = 0, reported = 0;   // round trip to the room (90th percentile), and the value the room last heard
@@ -76,7 +77,7 @@
       ws.onopen = () => {
         retries = 0;
         heard = Date.now();
-        if (rejoin) send({ t: 'rejoin', slot: me, version: opts.version });
+        if (rejoin) send({ t: 'rejoin', slot: me, token: rejoinToken, version: opts.version });
         else send({ t: 'hello', name: opts.name, version: opts.version });
         send({ t: 'ping', ts: Date.now() });
       };
@@ -104,8 +105,18 @@
     }
 
     function onMessage(m, from) {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
       if (from && opts.testLoss && Math.random() < opts.testLoss) return;
-      if (m.t === 'in') { if (game) deliver(game, m); else early.push(m); }
+      if (m.t === 'in') {
+        // The room authenticates relayed batches. A direct channel is bound to one peer,
+        // so do not let it supply another player's inputs or hashes (including our own).
+        const valid = (rows, size) => Array.isArray(rows) && rows.every((row) =>
+          Array.isArray(row) && row.length === size && row.every(Number.isInteger) &&
+          Number.isInteger(row[0]) && row[0] >= 0 && row[0] < 4 && row[0] !== me &&
+          (!from || row[0] === from.slot));
+        if (!valid(m.d ?? [], 8) || !valid(m.h ?? [], 4)) return;
+        if (game) deliver(game, m); else early.push(m);
+      }
       else if (m.t === 'ping' && from) from.dc.send(JSON.stringify({ t: 'pong', ts: m.ts }));
       else if (m.t === 'pong') {
         const ms = Date.now() - m.ts;
@@ -124,7 +135,7 @@
       let p = peers.get(slot);
       if (p) return p;
       const pc = new RTCPeerConnection({ iceServers: opts.iceServers || [], iceTransportPolicy: opts.relayOnly ? 'relay' : 'all' });
-      p = { pc, dc: null, trip: trip(), rtt: 0 };
+      p = { slot, pc, dc: null, trip: trip(), rtt: 0 };
       peers.set(slot, p);
       const use = (dc) => {
         p.dc = dc;
@@ -164,7 +175,10 @@
     function onSocketMessage(ev) {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.t === 'lobby') {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      if (m.t === 'joined') {
+        if (typeof m.token === 'string') rejoinToken = m.token;
+      } else if (m.t === 'lobby') {
         me = m.you;
         if (webrtc) {
           const present = new Set(m.players.map((p) => p.slot));
