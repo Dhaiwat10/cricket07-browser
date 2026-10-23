@@ -35,8 +35,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def translate_path(self, path):
         p = urllib.parse.unquote(urllib.parse.urlparse(path).path)
         if p.startswith("/build/"):
-            return os.path.join(BUILD, p[len("/build/"):])
-        return os.path.join(HERE, p.lstrip("/"))
+            root, relative = BUILD, p[len("/build/"):]
+        else:
+            root, relative = HERE, p.lstrip("/")
+        # URL paths use forward slashes. Reject Windows separators, drive/stream syntax and
+        # parent components on every platform, then resolve links before checking containment.
+        if "\\" in relative or ":" in relative or "\x00" in relative or ".." in relative.split("/"):
+            raise ValueError("Path outside served directory")
+        root = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root, *relative.split("/")))
+        candidates = [target]
+        if os.path.isdir(target):
+            # SimpleHTTPRequestHandler opens directory indexes without translate_path().
+            for index in getattr(self, "index_pages", ("index.html", "index.htm")):
+                index_path = os.path.join(target, index)
+                if os.path.isfile(index_path):
+                    candidates.append(os.path.realpath(index_path))
+                    break
+        for candidate in candidates:
+            if os.path.normcase(os.path.commonpath([root, candidate])) != os.path.normcase(root):
+                raise ValueError("Path outside served directory")
+        return target + "/" if p.endswith("/") else target
+
+    def send_head(self):
+        # Both GET and HEAD use this path, including directory indexes and listings.
+        try:
+            return super().send_head()
+        except ValueError:
+            self.send_error(403, "Forbidden path")
+            return None
 
 
 def main():
