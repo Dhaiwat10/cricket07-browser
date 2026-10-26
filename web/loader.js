@@ -25,6 +25,10 @@ const status = (t) => { $('status').textContent = t; };
 const show = (view) => { for (const v of document.querySelectorAll('#panel .view')) v.classList.toggle('hidden', v.id !== 'view-' + view); };
 const fail = (e) => { status('Error: ' + e.message); $('panel').classList.remove('hidden'); show('loading'); };
 const mb = (n) => (n / 1e6).toFixed(0);
+// key names as printed on the player's keyboard: a Mac's say Option, Return and so on where a PC's say Alt, Enter
+const IS_MAC = /mac/i.test(navigator.userAgentData?.platform || navigator.platform || '');
+const MAC_KEYS = { Alt: '⌥ Option', Enter: 'Return' };
+const keyName = (k) => (IS_MAC && MAC_KEYS[k]) || k;
 
 // ------------------------------------------------------------------ game files in OPFS
 
@@ -395,6 +399,7 @@ function setupFullscreen() {
   };
   if (!stage.requestFullscreen && !stage.webkitRequestFullscreen) { $('fs').classList.add('hidden'); return; }
   $('fs').onclick = toggle;
+  $('fs').title = `Fullscreen (${keyName('Alt')}+${keyName('Enter')})`;
   const swallow = (e) => {
     if (e.code !== 'Enter' && e.code !== 'NumpadEnter') return;
     if (!e.altKey) return;
@@ -406,7 +411,8 @@ function setupFullscreen() {
   window.addEventListener('keyup', swallow, true);
   const sync = () => {
     $('fs-icon').setAttribute('d', active() ? 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5' : 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5');
-    $('fs').title = active() ? 'Exit fullscreen (Alt+Enter or Esc)' : 'Fullscreen (Alt+Enter)';
+    const keys = `${keyName('Alt')}+${keyName('Enter')}`;
+    $('fs').title = active() ? `Exit fullscreen (${keys} or Esc)` : `Fullscreen (${keys})`;
   };
   document.addEventListener('fullscreenchange', sync);
   document.addEventListener('webkitfullscreenchange', sync);
@@ -561,6 +567,16 @@ function setupKbdHelp() {
   apply();
 }
 
+// On a Mac, every <kbd> on the page (cheat sheet, home screen, fullscreen tip) takes the Mac key's name,
+// hints written for PC players about the Mac (.not-mac) go, and the body's .mac class widens the cheat sheet.
+function macKeys() {
+  if (!IS_MAC) return;
+  document.body.classList.add('mac');
+  for (const k of document.querySelectorAll('kbd')) k.textContent = keyName(k.textContent.trim());
+  for (const e of document.querySelectorAll('.not-mac')) e.remove();
+}
+
+macKeys();
 setupFullscreen();
 setupKbdHelp();
 boot();
