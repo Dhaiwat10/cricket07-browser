@@ -449,20 +449,26 @@ function setupOnline() {
   if (params.get('join')) $('np-code').value = params.get('join').toUpperCase();
   let client = null;
   let lastPlayers = [];
+  let searching = null;   // AbortController of a quick-match search
+
+  const ticket = async () => {
+    const res = await fetch(NETPLAY_BASE + '_netplay_ticket', { cache: 'no-store' });
+    if (!res.ok) throw new Error('Online play is not available on this server.');
+    return res.json();
+  };
 
   // create: the host's first connection, which places the room in `region` (the Worker's location hint)
-  async function enter(code, create) {
+  // matched: a quick-match room: whoever gets in first creates it, and the match starts on its own
+  async function enter(code, create, matched) {
     if (client) return;
     const name = $('np-name').value.trim() || 'Player';
     try { localStorage.setItem('rc-name', name); localStorage.setItem('rc-region', $('np-region').value); } catch { /* storage blocked */ }
     msg('Connecting…');
     let iceServers;   // from the first ticket (TURN credentials last a day)
     const roomUrl = async () => {   // a fresh ticket each time (they expire after an hour)
-      const res = await fetch(NETPLAY_BASE + '_netplay_ticket', { cache: 'no-store' });
-      if (!res.ok) throw new Error('Online play is not available on this server.');
-      const { ticket, iceServers: ice } = await res.json();
+      const { ticket: t, iceServers: ice } = await ticket();
       iceServers ??= ice;
-      const url = new URL(`netplay/${code}?ticket=${encodeURIComponent(ticket)}`, NETPLAY_BASE);
+      const url = new URL(`netplay/${code}?ticket=${encodeURIComponent(t)}`, NETPLAY_BASE);
       if (create) { url.searchParams.set('create', '1'); url.searchParams.set('region', $('np-region').value); create = false; }
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
       return url.href;
@@ -473,9 +479,17 @@ function setupOnline() {
     invite.search = `?join=${code}` + (params.get('netplay') ? `&netplay=${encodeURIComponent(params.get('netplay'))}` : '');
     $('np-room').textContent = code;
     $('invite').textContent = invite.href;
+    $('np-copy').classList.toggle('hidden', !!matched);
+    $('np-waittext').textContent = matched ? 'Starting the match…' : 'Waiting for the host to start.';
     const version = await buildVersion();
     let session = null;
     const left = new Set();
+    // quick match: the host starts once both are in and the round trips have had a moment to settle;
+    // an opponent who never turns up (they closed the page while searching) sends this player back to searching
+    let autoStart = null;
+    const noShow = matched && setTimeout(() => {
+      if (client === me && !session && lastPlayers.length < 2) { leave(); search(); }
+    }, 12000);
     const me = client = RcNetplay.connect({
       url, name, version, reconnectUrl: roomUrl, iceServers, relayOnly: params.get('turn') === 'only',
       onReconnect(state) { if (session) session.reconnecting = state === 'connecting'; },
@@ -501,18 +515,22 @@ function setupOnline() {
         }
         if (l.players.length < 2) {
           const li = el('li', 'empty');
-          li.append(el('div', 'avatar', '?'), el('div', 'who', 'Waiting for your friend to join…'));
+          li.append(el('div', 'avatar', '?'), el('div', 'who', matched ? 'Waiting for your opponent…' : 'Waiting for your friend to join…'));
           $('np-players').appendChild(li);
         }
-        $('np-hostctl').classList.toggle('hidden', !l.host);
+        $('np-hostctl').classList.toggle('hidden', !l.host || !!matched);
         $('np-start').disabled = l.players.length !== 2;
         if (l.players.length > 2) msg('This is a 1v1 game: only two players can be in the room.');
         lastPlayers = l.players;
         const auto = RcNetplay.autoDelay(l.players);
         $('np-delay').options[0].textContent = `Auto (${auto} frames, ${Math.round(auto * 1000 / 60)} ms)`;
-        $('np-wait').classList.toggle('hidden', l.host);
+        $('np-wait').classList.toggle('hidden', l.host && !matched);
+        if (matched && l.host && l.players.length === 2) autoStart ??= setTimeout(() => client === me && client.start(RcNetplay.autoDelay(lastPlayers)), 3000);
+        else if (autoStart && l.players.length !== 2) { clearTimeout(autoStart); autoStart = null; }
       },
       onStart(s) {
+        clearTimeout(autoStart);
+        clearTimeout(noShow);
         session = { ...s, client, left };
         run(session).catch(fail);
       },
@@ -528,6 +546,47 @@ function setupOnline() {
     show('online');
   }
   $('np-leave').onclick = () => { leave(); msg(''); };
+
+  // Quick match: ask the server for an opponent with the same game build (server/worker.js: Matchmaker),
+  // then join the room it names. Each request waits up to 20 s; an empty answer means search again.
+  function searchUi(on) {
+    $('np-search').disabled = on;
+    $('np-searching').classList.toggle('hidden', !on);
+  }
+  async function search() {
+    if (client || searching) return;
+    const abort = searching = new AbortController();
+    searchUi(true);
+    msg('');
+    const id = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+    let url;
+    // a request the page drops doesn't reach the server, so stopping (Cancel, closing the page) is sent
+    const cancel = () => { if (url) fetch(url + '&cancel=1', { keepalive: true }).catch(() => {}); };
+    abort.signal.addEventListener('abort', cancel);
+    window.addEventListener('pagehide', cancel);
+    try {
+      const version = await buildVersion();
+      for (;;) {
+        const { ticket: t } = await ticket();
+        url = new URL(`match?ticket=${encodeURIComponent(t)}&version=${encodeURIComponent(version)}&id=${id}`, NETPLAY_BASE).href;
+        const res = await fetch(url, { cache: 'no-store', signal: abort.signal });
+        if (res.status === 204) continue;
+        if (!res.ok) throw new Error('Quick match is not available on this server.');
+        const { code } = await res.json();
+        window.removeEventListener('pagehide', cancel);
+        searching = null;
+        searchUi(false);
+        await enter(code, true, true);
+        return;
+      }
+    } catch (e) {
+      window.removeEventListener('pagehide', cancel);
+      if (searching === abort) { searching = null; searchUi(false); }
+      if (e.name !== 'AbortError') msg(e.message);
+    }
+  }
+  $('np-search').onclick = () => search();
+  $('np-cancel').onclick = (e) => { e.preventDefault(); searching?.abort(); searching = null; searchUi(false); };
   $('np-copy').onclick = async () => {
     const b = $('np-copy');
     try { await navigator.clipboard.writeText($('invite').textContent); b.textContent = 'Link copied'; }

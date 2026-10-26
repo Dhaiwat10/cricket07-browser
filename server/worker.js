@@ -4,6 +4,7 @@
 //
 //   GET /_netplay_ticket   a short-lived signed ticket plus ICE servers for direct WebRTC channels
 //   /netplay/<code>        WebSocket into the room (a Durable Object), presenting the ticket
+//   GET /match             quick match: waits until another player searches, then both get the same room code
 //
 // A room relays lobby events and lockstep inputs between up to 4 peers (see NetplayRoom below,
 // web/netplay.js and host/netplay.c). Setup: see README.md in this folder.
@@ -213,6 +214,41 @@ export class NetplayRoom {
   }
 }
 
+// Quick match: every search reaches this one object (idFromName('global')), which handles them one at a
+// time, so the second searcher always finds the first. A search is a long poll: it answers with a fresh
+// room code once someone else with the same game build searches, or 204 after a while (the page searches
+// again). Both players then join that room as if one had shared the code. A page that stops searching says
+// so (cancel=1 with its search id), since a dropped request doesn't reach the object. Only in memory: if
+// the object restarts, waiting searches fail and the pages search again.
+const MATCH_WAIT_MS = 20000;
+
+export class Matchmaker {
+  constructor(ctx) { this.ctx = ctx; this.waiting = new Map(); }   // game build -> the search waiting for a match
+
+  async fetch(request) {
+    const params = new URL(request.url).searchParams;
+    const version = params.get('version') || '', id = params.get('id') || '';
+    if (params.get('cancel') === '1') {
+      const w = this.waiting.get(version);
+      if (w && id && w.id === id) { this.waiting.delete(version); w.resolve(null); }
+      return new Response(null, { status: 204 });
+    }
+    const other = this.waiting.get(version);
+    if (other) {
+      this.waiting.delete(version);
+      const code = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b % 32]).join('');
+      other.resolve(code);
+      return Response.json({ code });
+    }
+    const code = await new Promise((resolve) => {
+      const me = { id, resolve };
+      this.waiting.set(version, me);
+      setTimeout(() => { if (this.waiting.get(version) === me) this.waiting.delete(version); resolve(null); }, MATCH_WAIT_MS);
+    });
+    return code ? Response.json({ code }) : new Response(null, { status: 204 });
+  }
+}
+
 // Durable Object location hints (developers.cloudflare.com/durable-objects/reference/data-location/)
 const REGIONS = ['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'apac-ne', 'apac-se', 'oc', 'afr', 'me'];
 
@@ -250,6 +286,11 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/netplay/')) return netplay(request, env, url);
+    if (url.pathname === '/match' && request.method === 'GET') {
+      if (!(await ticketValid(env, url.searchParams.get('ticket')))) return respond('Forbidden', 403, cors(request, env));
+      const res = await env.MATCH.get(env.MATCH.idFromName('global')).fetch(request);
+      return new Response(res.body, { status: res.status, headers: { ...Object.fromEntries(res.headers), 'Cache-Control': 'no-store', ...cors(request, env) } });
+    }
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors(request, env), 'Access-Control-Allow-Methods': 'GET' } });
     if (url.pathname === '/_netplay_ticket' && request.method === 'GET') {
       const secret = ticketSecret(env);

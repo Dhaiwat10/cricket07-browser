@@ -1,7 +1,8 @@
 # Netplay room server
 
-Online play needs a small server where players meet: it hands out tickets, relays the lobby, and
-relays inputs when two players can't connect to each other directly. This folder is that server, as a
+Online play needs a small server where players meet: it hands out tickets, pairs up players who search
+for a quick match, relays the lobby, and relays inputs when two players can't connect to each other
+directly. This folder is that server, as a
 Cloudflare Worker with a Durable Object per room. It never sees the game: no page, no build, no files.
 
 ```bash

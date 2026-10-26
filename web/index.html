@@ -210,7 +210,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/><path d="M2.5 19c.7-3 2.9-5 5.5-5s4.8 2 5.5 5"/><path d="M13.5 14.6c.8-.4 1.6-.6 2.5-.6 2.6 0 4.8 2 5.5 5"/></svg>
             <b>Play Multiplayer</b>
-            <span>Online 1v1 with a friend, wherever they are.</span>
+            <span>Online 1v1 with a friend or a random opponent.</span>
           </button>
         </div>
         <p class="small" style="margin-top:22px">Use a controller, or the keyboard: arrows to move, S to select.<br>
@@ -229,6 +229,14 @@
           <label class="field">Your name
             <input id="np-name" placeholder="Player" maxlength="24" autocomplete="nickname">
           </label>
+          <div class="card">
+            <h2>Quick match</h2>
+            <p class="small" style="margin:0 0 12px">Play whoever else is searching right now.</p>
+            <button id="np-search" class="btn" style="width:100%">Find an opponent</button>
+            <p id="np-searching" class="hidden small" style="margin:12px 0 0"><span class="spinner"></span>Searching for an opponent…
+              <a href="#" id="np-cancel">Cancel</a></p>
+          </div>
+          <div class="or">or play a friend</div>
           <div class="card">
             <h2>Host a game</h2>
             <p class="small" style="margin:0 0 12px">Get a room code to send to your friend.</p>
@@ -288,7 +296,7 @@
               <p class="small" style="margin:8px 0 0">Auto picks the lowest delay your connection allows. Higher is smoother on a bad link; 2 or 3 frames need a direct connection in the same city or country.</p>
             </details>
           </div>
-          <p id="np-wait" class="hidden small"><span class="spinner"></span>Waiting for the host to start.</p>
+          <p id="np-wait" class="hidden small"><span class="spinner"></span><span id="np-waittext">Waiting for the host to start.</span></p>
           <p id="np-lobbymsg" class="msg"></p>
         </div>
       </section>
