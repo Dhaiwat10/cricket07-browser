@@ -126,14 +126,37 @@ function hookInput(M, net) {
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     return;
   }
+  // Keys currently held (HID usages), so focus loss can release them: a keyup that happens while the
+  // window is unfocused never arrives, and the game would keep running/walking forever.
+  const held = new Set();
+  const release = (u) => { if (held.delete(u)) M._input_key_hid(u, 0); };
+  const releaseAll = () => { for (const u of [...held]) release(u); };
   const key = (down) => (e) => {
     const u = HID[e.code];
-    if (u === undefined || e.repeat) return;
+    if (u === undefined) return;
+    // Leave typing in the page's own text fields alone (name / room code boxes).
+    const t = e.target;
+    if (t && t !== canvas && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
     if (!(e.metaKey && !down)) e.preventDefault();
-    M._input_key_hid(u, down ? 1 : 0);
+    if (down) {
+      if (e.repeat || held.has(u)) return;
+      held.add(u);
+      M._input_key_hid(u, 1);
+    } else {
+      // On macOS a keyup can be dropped while Cmd is held; always let a release through.
+      release(u);
+    }
   };
   window.addEventListener('keydown', key(true));
   window.addEventListener('keyup', key(false));
+  window.addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+  // In fullscreen the browser eats Esc (exits fullscreen) before the game sees it; the Keyboard Lock API
+  // (Chromium) hands it to the page so Esc pauses the game as expected.
+  const lockEsc = () => {
+    if (document.fullscreenElement && navigator.keyboard?.lock) navigator.keyboard.lock(['Escape']).catch(() => {});
+  };
+  document.addEventListener('fullscreenchange', lockEsc);
   // The game draws its own cursor and reads relative motion. Lock the pointer when the browser allows
   // it (then the system cursor can't leave the game); without a lock, motion over the canvas still works.
   canvas.addEventListener('mousedown', (e) => {
