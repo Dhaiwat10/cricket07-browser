@@ -126,14 +126,18 @@ function hookInput(M, net) {
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     return;
   }
+  const held = new Set();   // HID usages the game currently sees as down
   const key = (down) => (e) => {
     const u = HID[e.code];
     if (u === undefined || e.repeat) return;
     if (!(e.metaKey && !down)) e.preventDefault();
+    if (down) held.add(u); else held.delete(u);
     M._input_key_hid(u, down ? 1 : 0);
   };
   window.addEventListener('keydown', key(true));
   window.addEventListener('keyup', key(false));
+  // Leaving the window (Alt+Tab) sends the key-up elsewhere, so the game would see Alt held for good
+  window.addEventListener('blur', () => { for (const u of held) M._input_key_hid(u, 0); held.clear(); });
   // The game draws its own cursor and reads relative motion. Lock the pointer when the browser allows
   // it (then the system cursor can't leave the game); without a lock, motion over the canvas still works.
   canvas.addEventListener('mousedown', (e) => {
