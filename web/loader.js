@@ -11,8 +11,9 @@
 //              ?join=<room code>
 //
 // Online play (netplay.js, host/netplay.c): players meet in a room on the server; when the host starts,
-// every page boots the game in deterministic lockstep mode with fresh saves, and only pad inputs travel.
-// Each player's keyboard and first gamepad merge into one local pad; mouse and raw keys are off.
+// every page boots the game in deterministic lockstep mode with fresh saves, and only pad and mouse inputs
+// travel. Each player's keyboard and first gamepad merge into one local pad; raw keys are off. Every
+// player's mouse moves the game's one cursor.
 'use strict';
 
 const $ = (id) => document.getElementById(id);
@@ -97,7 +98,7 @@ Object.assign(HID, {
 for (let i = 1; i <= 12; i++) HID['F' + i] = 57 + i;
 for (let i = 1; i <= 9; i++) HID['Numpad' + i] = 88 + i;
 
-// Netplay: the keyboard drives this player's pad (the game itself gets no keys or mouse, which would desync).
+// Netplay: the keyboard drives this player's pad (the game itself gets no keys, which would desync).
 // Bit 4 is LB, which the game sees as L1: its modifier for lofted shots (the in-game tutorial: "L1 + shot
 // button" to hit a six; on the keyboard that's Shift), so Shift holds it as well as Q. The game pauses only
 // on the keyboard's Esc, not the pad's Start, so Esc is bit 20: host/netplay.c applies it to the DirectInput
@@ -112,30 +113,9 @@ let netKeyPressed = 0;   // keys pressed since the last poll, so a tap shorter t
 
 function hookInput(M, net) {
   const canvas = $('canvas');
-  if (net) {
-    const key = (down) => (e) => {
-      const bit = NET_KEYS[e.code];
-      if (bit === undefined) return;
-      e.preventDefault();
-      if (down) { netKeyBits |= 1 << bit; netKeyPressed |= 1 << bit; } else netKeyBits &= ~(1 << bit);
-      pollLocalPad(M);   // straight to the game: waiting for the next animation frame would add up to 16 ms
-    };
-    window.addEventListener('keydown', key(true));
-    window.addEventListener('keyup', key(false));
-    window.addEventListener('blur', () => { netKeyBits = 0; pollLocalPad(M); });
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    return;
-  }
-  const key = (down) => (e) => {
-    const u = HID[e.code];
-    if (u === undefined || e.repeat) return;
-    if (!(e.metaKey && !down)) e.preventDefault();
-    M._input_key_hid(u, down ? 1 : 0);
-  };
-  window.addEventListener('keydown', key(true));
-  window.addEventListener('keyup', key(false));
   // The game draws its own cursor and reads relative motion. Lock the pointer when the browser allows
   // it (then the system cursor can't leave the game); without a lock, motion over the canvas still works.
+  // Online, host/netplay.c sends the mouse with the pad inputs instead of handing it to the game.
   canvas.addEventListener('mousedown', (e) => {
     if (document.pointerLockElement !== canvas) {
       const p = canvas.requestPointerLock?.();
@@ -146,6 +126,31 @@ function hookInput(M, net) {
   window.addEventListener('mouseup', (e) => M._input_mouse_button([0, 2, 1][e.button] ?? 0, 0));
   canvas.addEventListener('mousemove', (e) => M._input_mouse_move(e.movementX, e.movementY));
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  if (net) {
+    const key = (down) => (e) => {
+      const bit = NET_KEYS[e.code];
+      if (bit === undefined) return;
+      e.preventDefault();
+      if (down) { netKeyBits |= 1 << bit; netKeyPressed |= 1 << bit; } else netKeyBits &= ~(1 << bit);
+      pollLocalPad(M);   // straight to the game: waiting for the next animation frame would add up to 16 ms
+    };
+    window.addEventListener('keydown', key(true));
+    window.addEventListener('keyup', key(false));
+    window.addEventListener('blur', () => {
+      netKeyBits = 0;
+      pollLocalPad(M);
+      for (let b = 0; b < 3; b++) M._input_mouse_button(b, 0);   // a button held while leaving would stay down for everyone
+    });
+    return;
+  }
+  const key = (down) => (e) => {
+    const u = HID[e.code];
+    if (u === undefined || e.repeat) return;
+    if (!(e.metaKey && !down)) e.preventDefault();
+    M._input_key_hid(u, down ? 1 : 0);
+  };
+  window.addEventListener('keydown', key(true));
+  window.addEventListener('keyup', key(false));
 }
 
 // Gamepads (Gamepad API, polled every animation frame). Browsers only expose a pad after a button press

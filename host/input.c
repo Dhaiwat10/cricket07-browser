@@ -14,11 +14,14 @@
 void dinput_key(uint8_t dik, int down);
 void dinput_mouse_button(int b, int down);
 void dinput_mouse_move(int dx, int dy);
-/* Netplay (netplay.c): only pads are shared between peers, so keyboard and mouse don't reach the game
-   (one peer's keys would desync the others); the page maps the keyboard onto the local pad instead. */
+/* Netplay (netplay.c): only pad and mouse inputs are shared between peers, so the keyboard doesn't reach
+   the game (one peer's keys would desync the others); the page maps the keyboard onto the local pad
+   instead. The mouse goes to netplay.c, which applies every player's mouse on every peer alike. */
 int netplay_on(void);
 int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t axis[4]);
-EXPORT void input_mouse_move(int dx, int dy) { if (!netplay_on()) dinput_mouse_move(dx, dy); }
+int netplay_local_mouse_move(int dx, int dy);
+int netplay_local_mouse_button(int b, int down);
+EXPORT void input_mouse_move(int dx, int dy) { if (!netplay_local_mouse_move(dx, dy)) dinput_mouse_move(dx, dy); }
 /* Gamepads, in the W3C "standard gamepad" layout (both SDL's GameController and the browser's Gamepad API
    map onto it): buttons bit 0-16 = A B X Y, LB RB, LT RT (digital), Back Start, L3 R3, d-pad up down left
    right, Guide; axes -32768..32767 (left x/y, right x/y; +y = down). */
@@ -159,13 +162,19 @@ EXPORT void input_key_hid(int usage, int down) {
     input_key_usage_sync(usage, down);
 }
 
-EXPORT void input_mouse_button(int b, int down) {
+/* A mouse button the lockstep applies on every peer alike (netplay.c carries the mouse with the pad
+   inputs), or the physical mouse when not in netplay. */
+void input_mouse_button_sync(int b, int down) {
     static const uint8_t vk[3] = { 0x01, 0x02, 0x04 };  /* VK_LBUTTON, VK_RBUTTON, VK_MBUTTON */
-    if (netplay_on()) return;
     dinput_mouse_button(b, down);
     g_keys[vk[b]] = (uint8_t)down;
     static const uint32_t msg_down[3] = { 0x201, 0x204, 0x207 };
     post_message(MAIN_HWND, down ? msg_down[b] : msg_down[b] + 1, 0, 0);
+}
+
+EXPORT void input_mouse_button(int b, int down) {
+    if (netplay_local_mouse_button(b, down)) return;
+    input_mouse_button_sync(b, down);
 }
 
 /* Scripted input for automated testing, driven by the game's frame counter:
@@ -200,7 +209,7 @@ void input_script_tick(uint32_t frame) {
         } else if (!strncmp(a, "move=", 5)) {     /* move=dx:dy, relative mouse motion in pixels */
             int dx = (int)strtol(a + 5, (char **)&a, 10), dy = *a == ':' ? (int)strtol(a + 1, NULL, 10) : 0;
             fprintf(stderr, "[input] frame %u: move %d,%d\n", frame, dx, dy);
-            dinput_mouse_move(dx, dy);
+            input_mouse_move(dx, dy);
         } else if (!strncmp(a, "key=", 4)) {
             uint8_t code = (uint8_t)strtoul(a + 4, NULL, 16);
             fprintf(stderr, "[input] frame %u: key %02x\n", frame, code);

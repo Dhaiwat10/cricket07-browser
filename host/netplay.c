@@ -6,7 +6,7 @@
  * (D = input delay) and goes into the outbox; then the game thread waits until every player's input for
  * frame f + 1 is known and applies all of them at once, before the game reads input again. Frames 1..D
  * are neutral for everyone. Physical input never reaches the game directly in netplay: input_gamepad()
- * for the local pad only updates the sample taken at the next Present.
+ * for the local pad (and the local mouse) only updates the sample taken at the next Present.
  *
  * Frame time is an input too: in deterministic mode the game's clock only moves by what Present gives it,
  * so a fixed 1/60 s per frame would make the game run in slow motion whenever the players manage fewer
@@ -37,11 +37,15 @@
 #define NP_RING 512          /* frames of input kept per player */
 #define NP_HASH_EVERY 60
 
-typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us; } NpInput;   /* frame 0 = empty */
+typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us, mouse; } NpInput;   /* frame 0 = empty */
 /* buttons: standard-gamepad bits 0-16, plus keys the game only takes from the keyboard (pause is Esc, not
-   Start): they travel with the pad and are applied to the DirectInput keyboard on every peer */
+   Start): they travel with the pad and are applied to the DirectInput keyboard on every peer. The mouse
+   travels the same way: its buttons as bits 24-26 (left, right, middle), its motion as `mouse` (dx in the
+   low 16 bits, dy in the high, signed). */
 #define NP_PAD_BITS 0x1FFFFu
 #define NP_KEY_ESC (1u << 20)
+#define NP_MOUSE_SHIFT 24
+/* Input messages carry the frame time in hash_lo and the mouse motion in hash_hi. */
 typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t hash_lo, hash_hi; } NpMsg;
 enum { MSG_INPUT = 1, MSG_HASH = 2 };
 
@@ -51,6 +55,8 @@ static NpInput g_in[NP_SLOTS][NP_RING];
 static int g_left[NP_SLOTS];                /* peer gone: its pad reads neutral from then on */
 static NpInput g_local;                     /* latest physical/scripted state of the local pad */
 static uint32_t g_local_pressed;            /* buttons pressed since the last Present (see netplay_frame) */
+static uint32_t g_local_mouse;              /* local mouse buttons held, as NP_MOUSE_SHIFT bits */
+static int32_t g_local_mdx, g_local_mdy;    /* local mouse motion since the last Present */
 static pthread_mutex_t g_local_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define OUTBOX 1024
@@ -103,6 +109,25 @@ int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t ax
     return 1;
 }
 
+/* input_mouse_move() / input_mouse_button() land here in netplay mode: the local mouse is sampled at the
+   next Present like the pad, so every peer moves the game's one cursor alike. */
+int netplay_local_mouse_move(int dx, int dy) {
+    if (!netplay_on()) return 0;
+    pthread_mutex_lock(&g_local_lock);
+    g_local_mdx += dx; g_local_mdy += dy;
+    pthread_mutex_unlock(&g_local_lock);
+    return 1;
+}
+int netplay_local_mouse_button(int b, int down) {
+    if (!netplay_on()) return 0;
+    if (b < 0 || b > 2) return 1;
+    uint32_t bit = 1u << (NP_MOUSE_SHIFT + b);
+    pthread_mutex_lock(&g_local_lock);
+    if (down) { g_local_mouse |= bit; g_local_pressed |= bit; } else g_local_mouse &= ~bit;
+    pthread_mutex_unlock(&g_local_lock);
+    return 1;
+}
+
 static void outbox_push(const NpMsg *m) {
     uint32_t w = g_out_w;
     if (w - __atomic_load_n(&g_out_r, __ATOMIC_ACQUIRE) >= OUTBOX) { fprintf(stderr, "[netplay] outbox full\n"); return; }
@@ -123,10 +148,12 @@ static void inputs_changed(void) {
 #endif
 }
 
-static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us) {
+static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us,
+                        uint32_t mouse) {
     NpInput *e = &g_in[slot][frame % NP_RING];
     e->buttons = buttons;
     e->dt_us = dt_us;
+    e->mouse = mouse;
     for (int i = 0; i < 4; i++) e->axis[i] = axis[i];
     __atomic_store_n(&e->frame, frame, __ATOMIC_RELEASE);
 }
@@ -159,9 +186,14 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
        is only sampled here, once a frame, so a quick tap between two samples would otherwise be lost (and
        the slower the game runs, the more taps fall between samples). */
     pthread_mutex_lock(&g_local_lock);
-    m.buttons = g_local.buttons | g_local_pressed;
+    m.buttons = g_local.buttons | g_local_mouse | g_local_pressed;
     g_local_pressed = 0;
     for (int i = 0; i < 4; i++) m.axis[i] = g_local.axis[i];
+    /* mouse motion as two int16s; anything beyond that range goes out with the next frame */
+    int32_t sdx = g_local_mdx < -32768 ? -32768 : g_local_mdx > 32767 ? 32767 : g_local_mdx;
+    int32_t sdy = g_local_mdy < -32768 ? -32768 : g_local_mdy > 32767 ? 32767 : g_local_mdy;
+    g_local_mdx -= sdx; g_local_mdy -= sdy;
+    m.hash_hi = (uint32_t)(uint16_t)sdx | (uint32_t)(uint16_t)sdy << 16;
     pthread_mutex_unlock(&g_local_lock);
     if (g_np_slot == 0) {   /* the host's real frame time, for the frame this input belongs to */
         static double last;
@@ -173,7 +205,7 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
                                            than jumping ahead: a slowdown reads as "lag", a jump as broken */
         m.hash_lo = (uint32_t)(dt * 1e6);
     }
-    store_input(g_np_slot, m.frame, m.buttons, m.axis, m.hash_lo);
+    store_input(g_np_slot, m.frame, m.buttons, m.axis, m.hash_lo, m.hash_hi);
     outbox_push(&m);
     static int log_input = -1;   /* RC_NP_LOG_INPUT=1: log every non-neutral input this player sends */
     if (log_input < 0) log_input = getenv("RC_NP_LOG_INPUT") != NULL;
@@ -225,18 +257,29 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     static const int32_t zero[4] = { 0, 0, 0, 0 };
     extern void dinput_pad(int idx, int connected, uint32_t std_buttons, const int32_t axis[4]);
     uint32_t keys = 0;
+    int32_t mdx = 0, mdy = 0;
     for (int s = 0; s < g_np_players; s++) {
         NpInput *e = &g_in[s][next % NP_RING];
         int live = next > (uint32_t)g_np_delay && !g_left[s] && e->frame == next;
         uint32_t b = live ? e->buttons : 0;
         keys |= b;
         dinput_pad(s, 1, b & NP_PAD_BITS, live ? e->axis : zero);
+        if (live) { mdx += (int16_t)(e->mouse & 0xFFFF); mdy += (int16_t)(e->mouse >> 16); }
     }
     /* keyboard keys carried with the inputs: either player's Esc pauses, on every peer alike */
     extern void input_key_usage_sync(int usage, int down);
     static int esc_down;
     int esc = (keys & NP_KEY_ESC) != 0;
     if (esc != esc_down) { esc_down = esc; input_key_usage_sync(41 /* HID: Escape */, esc); }
+    /* the game has one mouse cursor: every player's motion moves it and either player's button presses it */
+    extern void dinput_mouse_move(int dx, int dy);
+    extern void input_mouse_button_sync(int b, int down);
+    if (mdx || mdy) dinput_mouse_move(mdx, mdy);
+    static uint32_t mouse_down;
+    uint32_t mouse = (keys >> NP_MOUSE_SHIFT) & 7;
+    for (int b = 0; b < 3; b++)
+        if ((mouse ^ mouse_down) >> b & 1) input_mouse_button_sync(b, mouse >> b & 1);
+    mouse_down = mouse;
     /* the frame time every peer uses for the next frame: the host's (1/60 s before inputs start or if the
        host has left) */
     NpInput *h = &g_in[0][next % NP_RING];
@@ -261,10 +304,10 @@ EXPORT int netplay_pop(void) {
 EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 10 ? (int32_t)g_popped[i] : 0; }
 
 EXPORT void netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry,
-                                 uint32_t dt_us) {
+                                 uint32_t dt_us, uint32_t mouse) {
     if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return;
     const int32_t axis[4] = { lx, ly, rx, ry };
-    store_input(slot, frame, buttons, axis, dt_us);
+    store_input(slot, frame, buttons, axis, dt_us, mouse);
     inputs_changed();
 }
 

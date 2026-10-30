@@ -26,7 +26,7 @@ static SDL_Window *g_window;
 
 void input_key_hid(int usage, int down);   /* input.c */
 void input_mouse_button(int b, int down);
-void dinput_mouse_move(int dx, int dy);
+void input_mouse_move(int dx, int dy);
 void input_gamepad(int idx, int connected, uint32_t buttons, int lx, int ly, int rx, int ry);
 
 /* Game controllers. Pads SDL has a GameController mapping for are read in that layout (= the W3C standard
@@ -155,7 +155,7 @@ void window_event_loop(void) {
             exit(0);
         case SDL_KEYDOWN: if (!e.key.repeat) input_key_hid((int)e.key.keysym.scancode, 1); break;
         case SDL_KEYUP: input_key_hid((int)e.key.keysym.scancode, 0); break;
-        case SDL_MOUSEMOTION: dinput_mouse_move(e.motion.xrel, e.motion.yrel); break;
+        case SDL_MOUSEMOTION: input_mouse_move(e.motion.xrel, e.motion.yrel); break;
         case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
             int b = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_RIGHT ? 1 : 2;
             input_mouse_button(b, e.type == SDL_MOUSEBUTTONDOWN);

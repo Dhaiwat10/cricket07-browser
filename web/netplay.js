@@ -184,7 +184,7 @@
     }
 
     function deliver(M, m) {
-      for (const [s, f, b, lx, ly, rx, ry, dt] of m.d || []) M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt >>> 0);
+      for (const [s, f, b, lx, ly, rx, ry, dt, mouse] of m.d || []) M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt >>> 0, mouse >>> 0);
       for (const [s, f, lo, hi] of m.h || []) M._netplay_remote_hash(s, f, lo, hi);
     }
 
@@ -195,7 +195,7 @@
       while (game._netplay_pop()) {
         const v = [];
         for (let i = 0; i < 10; i++) v.push(game._netplay_msg(i));
-        if (v[0] === 1) d.push([...v.slice(1, 8), v[8] >>> 0]);   // input: slot, frame, buttons, axes, frame time (us)
+        if (v[0] === 1) d.push([...v.slice(1, 8), v[8] >>> 0, v[9] >>> 0]);   // input: slot, frame, buttons, axes, frame time (us), mouse motion
         else if (v[0] === 2) h.push([v[1], v[2], v[8] >>> 0, v[9] >>> 0]);   // hash: slot, frame, lo, hi
       }
       if (!d.length && !h.length) return;
