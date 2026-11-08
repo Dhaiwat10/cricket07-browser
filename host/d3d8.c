@@ -6,6 +6,9 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#ifdef __EMSCRIPTEN__
+#include <malloc.h>
+#endif
 
 #define W(name) static void name(CPU *c)
 #define D3DERR_NOTAVAILABLE 0x8876086Au
@@ -43,7 +46,9 @@ static int supported_format(uint32_t f) {
     case FMT_A8R8G8B8: case FMT_X8R8G8B8: case FMT_R5G6B5: case FMT_X1R5G5B5: case FMT_A1R5G5B5:
     case FMT_A4R4G4B4: case FMT_A8: case FMT_L8: case FMT_A8L8: case FMT_P8:
     case FMT_DXT1: case FMT_DXT2: case FMT_DXT3: case FMT_DXT4: case FMT_DXT5:
-    case FMT_D16: case FMT_D24S8: case FMT_D24X8: case FMT_D32: return 1;
+    /* no D32: GeForce cards never offered it, and the game would pick it over D24S8 and lose the stencil bits
+       its shadows rely on (the renderer always has a stencil buffer anyway) */
+    case FMT_D16: case FMT_D24S8: case FMT_D24X8: return 1;
     default: return 0;
     }
 }
@@ -60,11 +65,28 @@ Device *g_device;                 /* ...and its state */
 
 /* ------------------------------------------------------------------ IDirect3D8 */
 
-static const struct { uint32_t w, h; } g_modes[] = {
+/* Display modes reported to the game (each in 32- and 16-bit). RC_MODES="1920x1080,2560x1440" replaces the list. */
+static struct { uint32_t w, h; } g_modes[64] = {
     { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 960 }, { 1280, 1024 },
     { 1600, 1200 },
 };
-#define NMODES (sizeof g_modes / sizeof g_modes[0])
+static uint32_t g_nmodes;
+static uint32_t nmodes(void) {
+    if (g_nmodes) return g_nmodes;
+    const char *e = getenv("RC_MODES");
+    if (e) {
+        for (const char *p = e; *p && g_nmodes < 64;) {
+            char *q;
+            uint32_t w = (uint32_t)strtoul(p, &q, 10), h = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
+            if (w && h) { g_modes[g_nmodes].w = w; g_modes[g_nmodes].h = h; g_nmodes++; }
+            p = q + strspn(q, ", ");
+            if (q == p && *p) p++;
+        }
+    }
+    if (!g_nmodes) g_nmodes = 8;
+    return g_nmodes;
+}
+#define NMODES nmodes()
 
 W(d3d_GetAdapterCount) { RET(1, 1); }
 W(d3d_RegisterSoftwareDevice) { RET(2, E_FAIL); }
@@ -88,7 +110,7 @@ W(d3d_GetAdapterModeCount) { RET(2, NMODES * 2); }
 W(d3d_EnumAdapterModes) {
     uint32_t i = ARG(2), p = ARG(3);
     if (i >= NMODES * 2) RET(4, D3DERR_INVALIDCALL);
-    W32(p, g_modes[i % NMODES].w); W32(p + 4, g_modes[i % NMODES].h); W32(p + 8, 60);
+    W32(p, g_modes[i % NMODES].w); W32(p + 4, g_modes[i % NMODES].h); W32(p + 8, (uint32_t)refresh_hz());
     W32(p + 12, i < NMODES ? FMT_X8R8G8B8 : FMT_R5G6B5);
     RET(4, S_OK);
 }
@@ -104,7 +126,17 @@ W(d3d_CheckDeviceFormat) {
                            ARG(6), r ? "no" : "ok");
     RET(7, r);
 }
-W(d3d_CheckDeviceMultiSampleType) { RET(6, ARG(5) <= 1 ? S_OK : D3DERR_NOTAVAILABLE); }
+/* Anti-aliasing: the game's menu offers 2x, 4x and 8x and drops a level the device rejects. WebGPU only
+   guarantees 4x, so all three are accepted and rendered at 4x. */
+W(d3d_CheckDeviceMultiSampleType) { uint32_t t = ARG(5);
+    if (getenv("RC_LOG_MSAA")) fprintf(stderr, "[d3d] CheckDeviceMultiSampleType(fmt %u, windowed %u, type %u)\n", ARG(3), ARG(4), t);
+    RET(6, t <= 1 || t == 2 || t == 4 || t == 8 ? S_OK : D3DERR_NOTAVAILABLE); }
+/* D3DPRESENT_PARAMETERS.MultiSampleType -> back buffer samples; RC_MSAA=0|4 overrides the game's choice */
+static uint32_t msaa_samples(uint32_t type) {
+    const char *e = getenv("RC_MSAA");
+    if (e) type = (uint32_t)atoi(e);
+    return type >= 2 ? 4 : 1;
+}
 W(d3d_CheckDepthStencilMatch) { RET(6, S_OK); }
 
 static void fill_caps(uint32_t p) {
@@ -144,8 +176,19 @@ W(d3d_GetDeviceCaps) { fill_caps(ARG(3)); RET(4, S_OK); }
 W(d3d_GetAdapterMonitor) { RET(2, 0x00070001u); }
 
 static uint32_t new_surface(uint32_t fmt, uint32_t w, uint32_t h, int rt, int depth, int with_mem);
+#ifndef __EMSCRIPTEN__
+void settings_apply_to_game(uint32_t pp, const uint32_t regs[4]);   /* settings.c: saved display settings */
+void settings_poll(uint32_t frame);
+#endif
+void widescreen_frame(void);   /* widescreen.c */
 W(d3d_CreateDevice) {
     uint32_t pp = ARG(5), out = ARG(6);
+#ifndef __EMSCRIPTEN__
+    {   /* before anything reads the parameters; the caller's callee-saved registers lead to the game's settings */
+        const uint32_t regs[4] = { c->esi, c->edi, c->ebx, c->ebp };
+        settings_apply_to_game(pp, regs);
+    }
+#endif
     Device *d = calloc(1, sizeof *d);
     d->width = R32(pp) ? R32(pp) : (uint32_t)g_screen_w;
     d->height = R32(pp + 4) ? R32(pp + 4) : (uint32_t)g_screen_h;
@@ -153,10 +196,11 @@ W(d3d_CreateDevice) {
     d->windowed = R32(pp + 28);
     d->depth_format = R32(pp + 32) ? R32(pp + 36) : 0;
     d->hwnd = R32(pp + 24) ? R32(pp + 24) : ARG(3);
+    d->msaa = msaa_samples(R32(pp + 16));
     d->d3d = THIS;
     fprintf(stderr, "[d3d] CreateDevice: %ux%u fmt %u, %s, backbuffers %u, multisample %u, swap %u, depth %u, "
-            "behavior %x, flags %x\n", d->width, d->height, d->backbuffer_format, d->windowed ? "windowed" : "fullscreen",
-            R32(pp + 12), R32(pp + 16), R32(pp + 20), d->depth_format, ARG(4), R32(pp + 40));
+            "behavior %x, flags %x (params at %08x)\n", d->width, d->height, d->backbuffer_format, d->windowed ? "windowed" : "fullscreen",
+            R32(pp + 12), R32(pp + 16), R32(pp + 20), d->depth_format, ARG(4), R32(pp + 40), pp);
     if (R32(pp) == 0) { W32(pp, d->width); W32(pp + 4, d->height); }
     d->backbuffer = new_surface(d->backbuffer_format, d->width, d->height, 1, 0, 0);
     if (d->depth_format) d->depth = new_surface(d->depth_format, d->width, d->height, 0, 1, 0);
@@ -289,8 +333,9 @@ W(dev_GetCreationParameters) {
 W(dev_Reset) {
     Device *d = dev(c);
     uint32_t pp = ARG(1);
-    fprintf(stderr, "[d3d] Reset to %ux%u\n", R32(pp), R32(pp + 4));
+    fprintf(stderr, "[d3d] Reset to %ux%u, multisample %u (params at %08x)\n", R32(pp), R32(pp + 4), R32(pp + 16), pp);
     if (R32(pp)) { d->width = R32(pp); d->height = R32(pp + 4); }
+    d->msaa = msaa_samples(R32(pp + 16));
     RET(2, S_OK);
 }
 /* Determinism checks: RC_HASH_LOG=<file> writes a hash of the game's global data (the executable's
@@ -320,7 +365,11 @@ static void state_hash_tick(uint32_t frame) {
             guest_mem_ranges(r);
             uint64_t hh = 1469598103934665603ull, hv = hh;
             for (uint32_t a = r[0]; a + 8 <= r[1]; a += 8) { hh ^= R64(a); hh *= 1099511628211ull; }
-            for (uint32_t a = r[2]; a + 8 <= r[3]; a += 8) { hv ^= R64(a); hv *= 1099511628211ull; }
+            for (uint32_t a = r[2]; a + 8 <= r[3]; a += 8) {
+                uint32_t skip = (a & 0xffff) ? 0 : guest_view_end(a);   /* views start on 64 KB boundaries */
+                if (skip) { a = skip - 8; continue; }
+                hv ^= R64(a); hv *= 1099511628211ull;
+            }
             fprintf(log, "%u heap %016llx %u MB valloc %016llx %u MB\n", frame, (unsigned long long)hh, (r[1] - r[0]) >> 20,
                     (unsigned long long)hv, (r[3] - r[2]) >> 20);
         }
@@ -357,7 +406,20 @@ W(dev_Present) {
     dump_tick(d->frame);
     extern void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void));
     netplay_frame(d->frame, state_hash_globals);   /* lockstep: exchange and apply pad inputs */
+    {   /* debugging: RC_WATCH="frame:addr" (hex addr) arms a write watchpoint (watch.c) from that frame */
+        static const char *w = (const char *)1;
+        if (w == (const char *)1) w = getenv("RC_WATCH");
+        if (w && d->frame >= (uint32_t)atoi(w) && d->frame < (uint32_t)atoi(w) + 60) {   /* re-armed each frame for 60 */
+            extern void watch_arm(uint32_t addr);
+            const char *colon = strchr(w, ':');
+            if (colon) watch_arm((uint32_t)strtoul(colon + 1, NULL, 16));
+        }
+    }
     vclock_frame();
+#ifndef __EMSCRIPTEN__
+    settings_poll(d->frame);   /* remember Display Options changes */
+#endif
+    widescreen_frame();        /* the cameras' aspect ratio */
     state_hash_tick(d->frame);
     static int exit_frame = -1;   /* RC_EXIT_FRAME=N: quit after frame N (benchmarks, determinism checks) */
     if (exit_frame < 0) exit_frame = getenv("RC_EXIT_FRAME") ? atoi(getenv("RC_EXIT_FRAME")) : 0;
@@ -377,9 +439,15 @@ W(dev_Present) {
         uint32_t hu, vu;
         guest_mem_stats(&hu, &vu);
         extern size_t g_gpu_tex_bytes;
-        extern uint32_t g_gpu_bind_groups_made;
-        fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB, GPU textures %zu MB, bind groups made %u\n",
-                hu >> 20, vu >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made);
+        extern uint32_t g_gpu_bind_groups_made, g_gpu_pipelines_made;
+        size_t host_used = 0, host_arena = 0;
+#ifdef __EMSCRIPTEN__
+        struct mallinfo mi = mallinfo();   /* the guest space is one block in here, so it counts in both */
+        host_used = mi.uordblks; host_arena = mi.arena;
+#endif
+        fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB, host malloc %zu MB (arena %zu MB), GPU textures %zu MB, "
+                "bind groups made %u, pipelines made %u, live COM objects %d\n", hu >> 20, vu >> 20, host_used >> 20,
+                host_arena >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made, g_gpu_pipelines_made, com_live_count());
         last_t = now; last_f = d->frame;
     }
     if (g_render->present) g_render->present(d);
@@ -522,7 +590,12 @@ W(dev_LightEnable) { if (ARG(1) < 8) dev(c)->st.light_enabled[ARG(1)] = ARG(2); 
 W(dev_GetLightEnable) { W32(ARG(2), ARG(1) < 8 ? dev(c)->st.light_enabled[ARG(1)] : 0); RET(3, S_OK); }
 W(dev_SetClipPlane) { if (ARG(1) < 6) memcpy(dev(c)->st.clip_plane[ARG(1)], HP(ARG(2)), 16); RET(3, S_OK); }
 W(dev_GetClipPlane) { if (ARG(1) < 6) memcpy(HP(ARG(2)), dev(c)->st.clip_plane[ARG(1)], 16); RET(3, S_OK); }
-W(dev_SetRenderState) { if (ARG(1) < 256) dev(c)->st.rs[ARG(1)] = ARG(2); RET(3, S_OK); }
+W(dev_SetRenderState) {
+    if (ARG(1) == 161 && getenv("RC_LOG_MSAA") && dev(c)->st.rs[161] != ARG(2))   /* D3DRS_MULTISAMPLEANTIALIAS */
+        fprintf(stderr, "[d3d] MULTISAMPLEANTIALIAS = %u\n", ARG(2));
+    if (ARG(1) < 256) dev(c)->st.rs[ARG(1)] = ARG(2);
+    RET(3, S_OK);
+}
 W(dev_GetRenderState) { W32(ARG(2), ARG(1) < 256 ? dev(c)->st.rs[ARG(1)] : 0); RET(3, S_OK); }
 
 /* State blocks: recorded blocks capture a full snapshot; good enough until a game relies on partial blocks. */
@@ -806,9 +879,14 @@ static void destroy_texture(void *p) {
     for (uint32_t f = 0; f < t->faces; f++)
         for (uint32_t l = 0; l < t->levels; l++) {
             heap_free(t->mem[f][l]);
-            /* level surfaces handed out earlier point into this memory: detach them */
-            Surface *s = t->surfaces[f][l] ? com_data(t->surfaces[f][l]) : NULL;
+            /* level surfaces handed out earlier point into this memory: detach them, then drop the reference the
+               texture holds on each (texture_surface). Without that a surface outlived its texture even after the
+               game released it: one COM slot (of 65,536), its memory and any render target behind it per level
+               surface ever handed out, until the slots ran out ("too many live COM objects") in the fifth match. */
+            uint32_t sg = t->surfaces[f][l];
+            Surface *s = sg ? com_data(sg) : NULL;
             if (s) { s->mem = 0; s->container = 0; }
+            if (sg) com_release(sg);
         }
     free(t);
 }
@@ -962,7 +1040,7 @@ static ComInterface IDirect3DSwapChain8_i __attribute__((unused)) = { "IDirect3D
 
 /* ------------------------------------------------------------------ headless backend */
 
-/* Headless "vsync": pace Present to 60 Hz like a real display would. RC_NO_PACE=1 skips the wait, so a
+/* Headless "vsync": pace Present to refresh_hz() (60 by default) like a real display would. RC_NO_PACE=1 skips the wait, so a
    deterministic run (virtual clock) goes as fast as the host allows: a benchmark of the CPU-side work. */
 static void hl_present(Device *d) {
     (void)d;
@@ -972,7 +1050,7 @@ static void hl_present(Device *d) {
     if (nopace) return;
     double now = host_seconds();
     if (next == 0 || now - next > 0.1) next = now;
-    next += 1.0 / 60.0;
+    next += 1.0 / refresh_hz();
     if (next > now) usleep((useconds_t)((next - now) * 1e6));
 }
 RenderBackend g_render_headless = { "headless", NULL, NULL, NULL, hl_present, NULL };

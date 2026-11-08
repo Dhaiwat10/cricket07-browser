@@ -11,6 +11,9 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 int texture_to_rgba8(uint32_t fmt, const uint8_t *src, uint32_t pitch, uint32_t w, uint32_t h, uint8_t *dst,
                      const uint8_t *palette);
@@ -126,6 +129,7 @@ static int want_screenshot(uint32_t frame) {
 static CmdTarget g_last_target;   /* zero: back buffer, not yet sent */
 static int g_target_sent;
 static uint32_t g_tgt_lw, g_tgt_lh;
+static int g_tgt_bb;   /* drawing into the back buffer */
 
 static void select_target(Device *d) {
     const DevState *st = &d->st;
@@ -134,9 +138,9 @@ static void select_target(Device *d) {
     CmdTarget t;
     memset(&t, 0, sizeof t);
     if (rt) { t.color_id = rt->gpu_id; t.color_w = rt->width; t.color_h = rt->height; t.lw = rt->width; t.lh = rt->height; }
-    else { t.lw = d->width; t.lh = d->height; }
+    else { t.lw = d->width; t.lh = d->height; t.msaa = d->msaa ? d->msaa : 1; }
     if (ds) { t.depth_id = ds->gpu_id; t.depth_w = ds->width; t.depth_h = ds->height; }
-    g_tgt_lw = t.lw; g_tgt_lh = t.lh;
+    g_tgt_lw = t.lw; g_tgt_lh = t.lh; g_tgt_bb = !rt;
     if (g_target_sent && !memcmp(&t.color_id, &g_last_target.color_id, sizeof t - sizeof t.h)) return;
     if (g_snap_detail)
         fprintf(stderr, "[target] color %u (%ux%u, logical %ux%u) depth %u\n", t.color_id, t.color_w, t.color_h, t.lw, t.lh,
@@ -264,18 +268,96 @@ static void sync_texture(Device *d, Texture *t) {
     t->sent_version = t->version;
 }
 
+/* ------------------------------------------------------------------ widescreen layout */
+
+/* Where a draw goes on a back buffer wider than 4:3 (render_cmd.h). 2D is pre-transformed vertices or an
+   orthographic projection (the game's HUD panels); a plain (untextured) fill across the whole width, such as the
+   cut-scene bars and fades, stretches like the scene behind it.
+   HUD: in a frame that shows a 3D scene (the front end has none, so menus stay centred), a small graphic at a side
+   of the screen (in its outer tenth, at most a quarter of its width; not text, not a menu's highlight bar) is moved
+   to the window's side, and so are the small pieces drawn over or next to it later in the frame: the power meter
+   and the balls below it, the radar and its dots, the replay picture-in-picture and its frame. Anything larger
+   (score bar, menus over the match, the coin toss panel) stays centred and whole, and so does what is drawn on such
+   a panel (the coin toss screen's pitch icon at its left edge). */
+typedef struct { float x1, y1, x2, y2; int side; } Anchored;
+static Anchored g_anchored[512], g_panels[64];   /* panels: large 2D drawn centred this frame */
+static int g_nanchored, g_npanels, g_scene_3d;
+
+static int overlaps(const Anchored *a, float x1, float y1, float x2, float y2, float margin) {
+    return x1 < a->x2 + margin && x2 > a->x1 - margin && y1 < a->y2 + margin && y2 > a->y1 - margin;
+}
+
+static int anchor_for(float x1, float y1, float x2, float y2, int can_root) {
+    if (!g_scene_3d) return 0;
+    float w = (float)g_tgt_lw, mid = w / 2.f;
+    int side = x2 <= mid + 1.f ? -1 : x1 >= mid - 1.f ? 1 : 0;
+    if (x2 - x1 > w * 0.25f) {
+        if (g_npanels < 64) g_panels[g_npanels++] = (Anchored){ x1, y1, x2, y2, 0 };
+        return 0;
+    }
+    if (!side) return 0;
+    int root = can_root && y2 - y1 <= (float)g_tgt_lh * 0.4f && (side < 0 ? x1 < w * 0.1f : x2 > w * 0.9f), over = 0;
+    for (int i = 0; i < g_npanels && root; i++) root = !overlaps(&g_panels[i], x1, y1, x2, y2, 0.f);
+    for (int i = 0; i < g_nanchored && !root && !over; i++)   /* over it or next to it */
+        over = g_anchored[i].side == side && overlaps(&g_anchored[i], x1, y1, x2, y2, 8.f);
+    if (!root && !over) return 0;
+    if (g_nanchored < 512) g_anchored[g_nanchored++] = (Anchored){ x1, y1, x2, y2, side };
+    return side;
+}
+
+static void draw_layout(const DevState *st, const FvfLayout *L, const void *sh, CmdDraw *c) {
+    if (!g_tgt_bb) return;
+    const float *P = st->transform[3], *vp = c->u.vp;
+    int rhw = !sh && L->pos_type == 0x4;
+    if (sh || (!rhw && !(P[11] == 0.f && P[15] == 1.f))) {   /* perspective */
+        if (vp[0] <= 0.f && vp[2] >= (float)g_tgt_lw) { g_scene_3d = 1; return; }
+        c->layout = LAYOUT_43_3D;
+        c->anchor = anchor_for(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3], 1);
+        return;
+    }
+    const CVert *v = (const CVert *)(c + 1);
+    const float *m = c->u.mvp;
+    float x1 = 1e30f, x2 = -1e30f, y1 = 1e30f, y2 = -1e30f;
+    for (uint32_t i = 0; i < c->nverts; i++) {
+        float x = v[i].x, y = v[i].y;
+        if (!rhw) {
+            x = vp[0] + (v[i].x * m[0] + v[i].y * m[4] + v[i].z * m[8] + m[12] + 1.f) * 0.5f * vp[2];
+            y = vp[1] + (1.f - (v[i].x * m[1] + v[i].y * m[5] + v[i].z * m[9] + m[13])) * 0.5f * vp[3];
+        }
+        if (x < x1) x1 = x;
+        if (x > x2) x2 = x;
+        if (y < y1) y1 = y;
+        if (y > y2) y2 = y;
+    }
+    int plain = c->slot_kind[0] == TS_NONE || st->tss[0][1] == 1;
+    if (plain && x1 <= 1.f && x2 >= (float)g_tgt_lw - 1.f) return;
+    c->layout = LAYOUT_43;
+    c->anchor = anchor_for(x1, y1, x2, y2, !rhw);   /* text (pre-transformed) only follows */
+    if (g_snap_detail) fprintf(stderr, "[layout] 2D x %g..%g y %g..%g anchor %d\n", x1, x2, y1, y2, c->anchor);
+}
+
 /* ------------------------------------------------------------------ clears */
 
-static void clear_quad(Device *d, float x1, float y1, float x2, float y2, uint32_t flags, uint32_t color, float z) {
-    if (x2 <= x1 || y2 <= y1 || !(flags & 3)) return;
+static void clear_quad(Device *d, float x1, float y1, float x2, float y2, uint32_t flags, uint32_t color, float z,
+                       uint32_t stencil) {
+    if (x2 <= x1 || y2 <= y1 || !(flags & 7)) return;
     CmdDraw *c = cmd_alloc(CMD_DRAW, sizeof *c + 6 * sizeof(CVert));
     c->key = (PKey){ 0, 2, 1, 1, 1, (flags & 2) ? 1u : 0u, 8, 1, (flags & 1) ? 0xFu : 0u, TOPO_TRIANGLES, 0 };
+    if (flags & 4) {   /* stencil: replace every covered pixel with the clear value */
+        c->key.sten = 1; c->key.sfunc = 8; c->key.sfail = c->key.szfail = c->key.spass = 3;
+        c->key.smask = c->key.swmask = 0xFF;
+        c->stencil_ref = stencil & 0xFF;
+    }
     c->full_viewport = 1;
     c->minz = 0.f; c->maxz = 1.f;
     c->capture_index = -1;
     for (int i = 0; i < 4; i++) c->samp_key[i] = sampler_key(d->st.tss[i]);
     c->u.vp[2] = (float)g_tgt_lw; c->u.vp[3] = (float)g_tgt_lh;
     c->u.flags[0] = 1;   /* pre-transformed */
+    if (g_tgt_bb && (x1 > 0.f || x2 < (float)g_tgt_lw)) {   /* part of the screen: placed like 2D (draw_layout) */
+        c->layout = LAYOUT_43;
+        c->anchor = anchor_for(x1, y1, x2, y2, 1);
+    }
     c->u.st0[0] = 1;     /* stage disabled: output = diffuse */
     c->nverts = 6;
     CVert *v = (CVert *)(c + 1);
@@ -309,8 +391,59 @@ static void rec_clear_impl(Device *d, uint32_t count, uint32_t rects, uint32_t f
             if (r[2] < x2) x2 = (float)r[2];
             if (r[3] < y2) y2 = (float)r[3];
         }
-        clear_quad(d, x1, y1, x2, y2, flags, color, z);
+        clear_quad(d, x1, y1, x2, y2, flags, color, z, stencil);
     }
+}
+
+/* ------------------------------------------------------------------ GPU vertex programs
+ * Vertex shaders run on the GPU: each distinct program (declaration + code) is translated to WGSL once and
+ * sent to the executor under a small id. The game creates its shaders afresh every match, so programs are
+ * matched by content. RC_CPU_VS=1 runs vertex shaders on the CPU instead (vs_run), for comparison. */
+
+typedef struct { uint32_t *decl, decl_len, *code, code_len, id; int ok; VsGpuInput in[16]; int nin; } RecVs;
+static RecVs **g_rvs;
+static uint32_t g_nrvs, g_caprvs;
+
+static int gpu_vs_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("RC_CPU_VS");
+    return on;
+}
+
+static RecVs *rec_vs_program(Shader *sh) {
+    if (sh->gpu) return sh->gpu;
+    uint32_t clen = sh->code ? sh->code_len : 0;
+    for (uint32_t i = 0; i < g_nrvs; i++) {
+        RecVs *r = g_rvs[i];
+        if (r->decl_len == sh->decl_len && r->code_len == clen && !memcmp(r->decl, sh->decl, sh->decl_len * 4) &&
+            (!clen || !memcmp(r->code, sh->code, clen * 4))) { sh->gpu = r; return r; }
+    }
+    RecVs *r = calloc(1, sizeof *r);
+    r->decl = malloc(sh->decl_len * 4 + 4); memcpy(r->decl, sh->decl, sh->decl_len * 4); r->decl_len = sh->decl_len;
+    r->code = malloc(clen * 4 + 4); if (clen) memcpy(r->code, sh->code, clen * 4); r->code_len = clen;
+    char why[96] = "";
+    r->nin = vs_gpu_inputs(sh, r->in);
+    for (int k = 0; k < r->nin; k++) if (r->in[k].stream >= 4) { snprintf(why, sizeof why, "uses stream %u", r->in[k].stream); r->nin = -1; }
+    char *wgsl = r->nin >= 0 ? vs_to_wgsl(sh, why, sizeof why) : NULL;
+    if (wgsl) {
+        r->ok = 1;
+        r->id = g_nrvs + 1;
+        size_t len = strlen(wgsl) + 1;
+        CmdVsProgram *c = cmd_alloc(CMD_VS_PROGRAM, sizeof *c + len);
+        c->id = r->id;
+        c->ninputs = (uint32_t)r->nin;
+        for (int k = 0; k < r->nin; k++) {
+            c->in_reg[k] = r->in[k].reg; c->in_stream[k] = r->in[k].stream; c->in_type[k] = r->in[k].type; c->in_offset[k] = r->in[k].offset;
+        }
+        memcpy(c + 1, wgsl, len);
+        cmd_end();
+        if (getenv("RC_DUMP_VS_WGSL")) fprintf(stderr, "[vs %u]\n%s", r->id, wgsl);
+        free(wgsl);
+    } else fprintf(stderr, "[render] vertex shader runs on the CPU: %s\n", why);
+    if (g_nrvs == g_caprvs) { g_caprvs = g_caprvs ? g_caprvs * 2 : 32; g_rvs = realloc(g_rvs, g_caprvs * sizeof *g_rvs); }
+    g_rvs[g_nrvs++] = r;
+    sh->gpu = r;
+    return r;
 }
 
 /* ------------------------------------------------------------------ draw */
@@ -379,7 +512,48 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         if (t && t->type == RT_TEXTURE && !(t->usage & 1)) sync_texture(d, t);
     }
 
-    CmdDraw *c = cmd_alloc(CMD_DRAW, sizeof *c + (size_t)n * sizeof(CVert));
+    /* GPU vertex program: send the referenced vertex range of each stream as stored, plus rebased indices */
+    RecVs *rv = sh && gpu_vs_on() ? rec_vs_program(sh) : NULL;
+    if (rv && !rv->ok) rv = NULL;
+    const uint8_t *sdata[4] = { 0 };
+    uint32_t sstride[4] = { 0 }, lo = 0xFFFFFFFFu, hi = 0;
+    if (rv) {
+        for (uint32_t i = 0; i < n; i++) { if (idx[i] < lo) lo = idx[i]; if (idx[i] > hi) hi = idx[i]; }
+        size_t total = 0;
+        for (int k = 0; k < rv->nin && rv; k++) {
+            uint32_t s = rv->in[k].stream;
+            if (sdata[s]) continue;
+            if (vertices_up) { if (s == 0) { sdata[0] = vertices_up; sstride[0] = up_stride; } }
+            else {
+                Buffer *sb = com_data(st->stream_vb[s]);
+                if (sb) { sdata[s] = HP(sb->mem); sstride[s] = st->stream_stride[s]; }
+            }
+            if (!sdata[s] || !sstride[s] || sstride[s] % 4 || sstride[s] > 0xFFFF) { rv = NULL; break; }
+            total += (size_t)(hi - lo + 1) * sstride[s];
+        }
+        if (rv && (!n || total > (8u << 20))) rv = NULL;   /* a sparse or huge range: CPU path */
+    }
+    CmdDraw *c;
+    if (rv) {
+        uint32_t range = hi - lo + 1, i32 = range > 0xFFFF;
+        size_t off = (VS_CONST_BYTES + (size_t)n * (i32 ? 4 : 2) + 15) & ~(size_t)15;
+        uint32_t soff[4] = { 0 };
+        for (int s = 0; s < 4; s++) if (sdata[s]) { soff[s] = (uint32_t)off; off += ((size_t)range * sstride[s] + 15) & ~(size_t)15; }
+        c = cmd_alloc(CMD_DRAW, sizeof *c + off);
+        uint8_t *pl = (uint8_t *)(c + 1);
+        float (*vc)[4] = (float (*)[4])pl;
+        memcpy(vc, st->vs_const, VS_CONST_BYTES);
+        vs_merge_defs(sh, vc);
+        if (i32) { uint32_t *o = (uint32_t *)(pl + VS_CONST_BYTES); for (uint32_t i = 0; i < n; i++) o[i] = idx[i] - lo; }
+        else { uint16_t *o = (uint16_t *)(pl + VS_CONST_BYTES); for (uint32_t i = 0; i < n; i++) o[i] = (uint16_t)(idx[i] - lo); }
+        for (int s = 0; s < 4; s++) if (sdata[s]) memcpy(pl + soff[s], sdata[s] + (size_t)lo * sstride[s], (size_t)range * sstride[s]);
+        c->vs_index32 = i32;
+        c->vs_idx_off = VS_CONST_BYTES;
+        memcpy(c->vs_stream_off, soff, sizeof soff);
+        c->nverts = n;
+        c->capture_index = g_snap_detail ? (int32_t)(g_f_drawn - 1) : -1;
+    } else {
+    c = cmd_alloc(CMD_DRAW, sizeof *c + (size_t)n * sizeof(CVert));
     CVert *cv = (CVert *)(c + 1);
     c->nverts = n;
     c->capture_index = g_snap_detail ? (int32_t)(g_f_drawn - 1) : -1;
@@ -417,6 +591,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
     } else {
         for (uint32_t i = 0; i < n; i++) convert_vertex(vb + (size_t)idx[i] * stride, &L, &cv[i]);
     }
+    }   /* CPU vertices */
     free(idx);
 
     for (int s = 0; s < 4; s++) {
@@ -432,7 +607,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
     c->pixel_shader = st->ps;
 
     Uniforms *u = &c->u;
-    if (!sh && L.pos_type != 0x4) {
+    if ((!sh && L.pos_type != 0x4) || (rv && vs_is_fixed_function(sh))) {
         float wv[16];
         mat_mul(st->transform[256], st->transform[2], wv);    /* WORLD * VIEW */
         mat_mul(wv, st->transform[3], u->mvp);                /* * PROJECTION */
@@ -474,7 +649,19 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
                st->rs[14], st->rs[23], st->rs[22], st->rs[168] & 0xF, topo, st->ps };
     if (L.pos_type == 0x4) k.cull = 1;  /* keep 2D simple: no culling for pre-transformed vertices */
     else if (k.cull == 2) k.cull = 3; else if (k.cull == 3) k.cull = 2;  /* D3D CW/CCW culls back/front with CW front */
+    if (st->rs[52] && st->depth_stencil) {   /* STENCILENABLE (the renderer's depth buffers all have stencil) */
+        k.sten = 1;
+        k.sfunc = st->rs[56]; k.sfail = st->rs[53]; k.szfail = st->rs[54]; k.spass = st->rs[55];
+        k.smask = st->rs[58] & 0xFF; k.swmask = st->rs[59] & 0xFF;
+        c->stencil_ref = st->rs[57] & 0xFF;
+    }
+    if (rv) {
+        k.vs = rv->id;
+        k.strides[0] = sstride[0] | sstride[1] << 16;
+        k.strides[1] = sstride[2] | sstride[3] << 16;
+    }
     c->key = k;
+    draw_layout(st, &L, sh, c);
     c->vp[0] = (float)st->viewport.x; c->vp[1] = (float)st->viewport.y;
     c->vp[2] = (float)(st->viewport.w ? st->viewport.w : g_tgt_lw);
     c->vp[3] = (float)(st->viewport.h ? st->viewport.h : g_tgt_lh);
@@ -495,13 +682,28 @@ static int rec_init(Device *d) {
 #endif
 }
 
+/* Menus, for the page's on-screen controls (web/loader.js shows a d-pad in menus and a stick in play): a frame
+   with no 3D scene behind it (the front end), or with a large 2D panel drawn centred over the scene (the pause
+   menu, the coin toss). The score bar is wide but thin, so play doesn't count. */
+static volatile int g_menu_frame = 1;
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int rc_in_menu(void) { return g_menu_frame; }
+
 static void rec_present_impl(Device *d) {
+    int menu = !g_scene_3d;
+    for (int i = 0; i < g_npanels && !menu; i++)
+        menu = g_panels[i].x2 - g_panels[i].x1 > (float)g_tgt_lw * 0.4f && g_panels[i].y2 - g_panels[i].y1 > (float)g_tgt_lh * 0.3f;
+    g_menu_frame = menu;
     CmdPresent *c = cmd_alloc(CMD_PRESENT, sizeof *c);
     c->frame = d->frame;
     c->screenshot = (uint32_t)want_screenshot(d->frame);
+    c->drawn = g_f_drawn;
     cmd_end();
     cmd_flush(1);
     g_target_sent = 0;   /* the executor ends every frame on the back buffer */
+    g_scene_3d = g_nanchored = g_npanels = 0;
     g_f_drawn = 0;
 #ifdef __EMSCRIPTEN__
     /* Don't run ahead of the display: two frames queued (a slow frame doesn't skip a vsync). Online every

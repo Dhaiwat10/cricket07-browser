@@ -16,7 +16,8 @@ extern char g_trap_msg[256];
 #define GUEST_HEAP_BASE        0x10000000u
 /* Natively the guest gets a full 4 GiB reservation. In the browser (wasm32) it must share a 4 GiB
    memory with everything else, so the heap and VirtualAlloc ranges are compacted: the game peaks at
-   ~125 MB of heap and ~580 MB of virtual allocations (mostly mapped archives). */
+   ~125 MB of heap and ~580 MB of virtual allocations (mostly mapped archives, of which only what the game reads becomes
+   resident: host/core.c, lazy file views). */
 #ifdef __EMSCRIPTEN__
 #define GUEST_SPACE            0x50000000ull
 #define GUEST_HEAP_HI          0x20000000u
@@ -34,6 +35,11 @@ typedef struct { const char *name; GuestFn fn; } ImportHandler;  /* name like "K
 typedef struct { uint32_t image_base, entry, num_imports; } LoadedImage;
 extern uint32_t g_image_lo, g_image_hi;   /* the loaded executable's address range */
 extern uint32_t g_state_lo, g_state_hi;   /* its writable sections (global data): what determinism checks hash */
+
+/* Entry hooks (profiles/cricket07.patches.json): hook_copy_source runs on entry to the game's memcpy and passes its source
+   range to g_copy_source_hook when the host has set one (host/core.c: lazy file views). */
+extern void (*g_copy_source_hook)(uint32_t src, uint32_t len);
+void hook_copy_source(CPU *c);
 
 void runtime_init(CPU *c);
 void set_import_handlers(ImportHandler *h, uint32_t n);  /* call before load_image */

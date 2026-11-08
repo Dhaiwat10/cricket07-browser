@@ -11,6 +11,7 @@
 #include "render_cmd.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <webgpu/webgpu.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -70,6 +71,7 @@ static const char *WGSL_COMMON =
 "    p.y = p.y - p.w / u.vp.w;\n"
 "    o.pos = p;\n"
 "  }\n"
+"  if (u.misc.z != 0.0) { o.pos.x = o.pos.x * u.misc.z + o.pos.w * u.misc.w; }   // 4:3 area of a wide picture\n"
 "  o.diffuse = d3dcolor(v.diffuse);\n"
 "  if (u.flags.w == 1u) { o.diffuse = clamp(o.diffuse * u.mat_diffuse + u.ambient, vec4<f32>(0.0), vec4<f32>(1.0)); }\n"
 "  o.specular = d3dcolor(v.specular);\n"
@@ -145,6 +147,7 @@ static void release_view(WGPUTextureView view);   /* drops cached bind groups us
 typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t used_in_batch, w, h, levels, fmt; size_t bytes; } GTex;
 int g_gpu_bc;               /* device has texture-compression-bc */
 size_t g_gpu_tex_bytes;     /* GPU memory in game textures, for the [mem] log */
+uint32_t g_gpu_pipelines_made;   /* for the [mem] log */
 typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t w, h; int depth, gpu_dirty; } GSurf;
 
 static WGPUInstance g_inst;
@@ -153,10 +156,18 @@ static WGPUDevice g_dev;
 static WGPUQueue g_queue;
 static WGPUSurface g_surface;
 static WGPUTextureFormat g_surf_fmt;
-static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window */
+static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window, or all of a wide one */
 static int g_win_w, g_win_h;     /* window (swap chain) size; the back buffer is centred in it */
 static WGPUTexture g_depth;
 static WGPUTextureView g_depth_view;
+/* Anti-aliasing: with g_bb_samples = 4 the back buffer's passes draw into multisampled color and depth
+   buffers and resolve into g_bb at the end of every pass, so presenting, screenshots and readbacks keep
+   reading g_bb. Render targets stay single-sampled. */
+static uint32_t g_bb_samples = 1;
+static WGPUTexture g_bb_ms, g_depth_ms;
+static WGPUTextureView g_bb_ms_view, g_depth_ms_view;
+static uint32_t g_pass_samples = 1;   /* sample count of the open pass (pipelines must match it) */
+static uint32_t g_pass_stencil_ref;   /* the open pass's stencil reference (WebGPU starts each pass at 0) */
 static WGPUTexture g_bb;          /* offscreen back buffer: always rendered, copied to the window when visible */
 static WGPUTextureView g_bb_view;
 static WGPUShaderModule g_shader;   /* shared header + fixed-function fragment stage */
@@ -164,9 +175,14 @@ static WGPUBindGroupLayout g_bgl_u, g_bgl_t;
 static WGPUPipelineLayout g_pl;
 static WGPUBuffer g_vbuf, g_ubuf;
 static uint32_t g_vpos, g_upos;
+/* CPU copies of the two rings: draws fill them, and submit() uploads each once (one wgpuQueueWriteBuffer per
+   ring per batch instead of up to three per draw, each of which made wgpu allocate a staging buffer). The
+   uploads are queued before the batch's command buffer, so its draws read what they wrote. */
+static uint8_t *g_vstage, *g_ustage;
 #define VBUF_SIZE (32u << 20)
 #define UBUF_SIZE (8u << 20)
 #define USTRIDE 512u
+#define USTRIDE_VS (512u + VS_CONST_BYTES)   /* uniforms, then the vertex shader constants at +512 */
 static WGPUBindGroup g_bg_u;
 static GTex g_white, g_black;
 static WGPUSampler g_samplers[1024];   /* indexed by sampler key: never evicted while in use */
@@ -237,13 +253,33 @@ static void make_depth(void) {
     td.usage = WGPUTextureUsage_RenderAttachment;
     g_depth = wgpuDeviceCreateTexture(g_dev, &td);
     g_depth_view = wgpuTextureCreateView(g_depth, NULL);
+    if (g_bb_ms) { wgpuTextureViewRelease(g_bb_ms_view); wgpuTextureDestroy(g_bb_ms); wgpuTextureRelease(g_bb_ms); g_bb_ms = NULL; }
+    if (g_depth_ms) { wgpuTextureViewRelease(g_depth_ms_view); wgpuTextureDestroy(g_depth_ms); wgpuTextureRelease(g_depth_ms); g_depth_ms = NULL; }
+    if (g_bb_samples > 1) {
+        bd.sampleCount = td.sampleCount = g_bb_samples;
+        bd.usage = td.usage = WGPUTextureUsage_RenderAttachment;
+        g_bb_ms = wgpuDeviceCreateTexture(g_dev, &bd);
+        g_bb_ms_view = wgpuTextureCreateView(g_bb_ms, NULL);
+        g_depth_ms = wgpuDeviceCreateTexture(g_dev, &td);
+        g_depth_ms_view = wgpuTextureCreateView(g_depth_ms, NULL);
+    }
 }
+
+static int widescreen(void) {
+    extern int widescreen_on(void);   /* widescreen.c */
+    return widescreen_on();
+}
+
+/* the back buffer's aspect ratio (4:3 until the renderer is up) */
+float render_aspect(void) { return g_surf_w > 0 && g_surf_h > 0 ? (float)g_surf_w / (float)g_surf_h : 4.f / 3.f; }
 
 static void configure_surface(void) {
     g_win_w = g_window_w > 0 ? g_window_w : 1024;
     g_win_h = g_window_h > 0 ? g_window_h : 768;
-    /* the game is 4:3: render at the largest 4:3 size that fits, letterboxed (no stretching) */
-    if (g_win_w * 3 > g_win_h * 4) { g_surf_h = g_win_h; g_surf_w = g_win_h * 4 / 3; }
+    /* the game is 4:3: render at the largest 4:3 size that fits, letterboxed (no stretching). Widescreen: a wider
+       window is filled; the game's cameras get its aspect ratio (widescreen.c) and 2D draws keep 4:3 (exec_draw). */
+    if (g_win_w * 3 > g_win_h * 4 && !widescreen()) { g_surf_h = g_win_h; g_surf_w = g_win_h * 4 / 3; }
+    else if (g_win_w * 3 > g_win_h * 4) { g_surf_w = g_win_w; g_surf_h = g_win_h; }
     else { g_surf_w = g_win_w; g_surf_h = g_win_w * 3 / 4; }
     WGPUSurfaceConfiguration sc = WGPU_SURFACE_CONFIGURATION_INIT;
     sc.device = g_dev;
@@ -256,7 +292,7 @@ static void configure_surface(void) {
     sc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
 #endif
     sc.alphaMode = WGPUCompositeAlphaMode_Opaque;
-    wgpuSurfaceConfigure(g_surface, &sc);
+    if (g_surface) wgpuSurfaceConfigure(g_surface, &sc);   /* RC_OFFSCREEN: no surface, only the back buffer */
     make_depth();
 }
 
@@ -292,7 +328,7 @@ static WGPUShaderModule make_module(const char *fragment) {
 /* everything after the device exists: surface format, back buffer, shaders, layouts, buffers */
 static void create_resources(void) {
     WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
-    wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps);
+    if (g_surface) wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps);
     g_surf_fmt = caps.formatCount ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
     for (size_t i = 0; i < caps.formatCount; i++)   /* prefer a non-sRGB format: D3D8 blends in gamma space */
         if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm) g_surf_fmt = caps.formats[i];
@@ -307,7 +343,11 @@ static void create_resources(void) {
     ue.buffer.hasDynamicOffset = 1;
     ue.buffer.minBindingSize = sizeof(Uniforms);
     WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    bd.entryCount = 1; bd.entries = &ue;
+    WGPUBindGroupLayoutEntry uentries[2] = { ue, ue };
+    uentries[1].binding = 1;                                   /* GPU vertex programs: constants c0-c95 */
+    uentries[1].visibility = WGPUShaderStage_Vertex;
+    uentries[1].buffer.minBindingSize = VS_CONST_BYTES;
+    bd.entryCount = 2; bd.entries = uentries;
     g_bgl_u = wgpuDeviceCreateBindGroupLayout(g_dev, &bd);
 
     WGPUBindGroupLayoutEntry te[8];
@@ -330,14 +370,17 @@ static void create_resources(void) {
     g_pl = wgpuDeviceCreatePipelineLayout(g_dev, &pld);
 
     WGPUBufferDescriptor bdesc = WGPU_BUFFER_DESCRIPTOR_INIT;
-    bdesc.size = VBUF_SIZE; bdesc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+    bdesc.size = VBUF_SIZE; bdesc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
     g_vbuf = wgpuDeviceCreateBuffer(g_dev, &bdesc);
+    g_vstage = malloc(VBUF_SIZE);
+    g_ustage = malloc(UBUF_SIZE);
     bdesc.size = UBUF_SIZE; bdesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     g_ubuf = wgpuDeviceCreateBuffer(g_dev, &bdesc);
-    WGPUBindGroupEntry be = WGPU_BIND_GROUP_ENTRY_INIT;
-    be.binding = 0; be.buffer = g_ubuf; be.size = sizeof(Uniforms);
+    WGPUBindGroupEntry be[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+    be[0].binding = 0; be[0].buffer = g_ubuf; be[0].size = sizeof(Uniforms);
+    be[1].binding = 1; be[1].buffer = g_ubuf; be[1].size = VS_CONST_BYTES;
     WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bgd.layout = g_bgl_u; bgd.entryCount = 1; bgd.entries = &be;
+    bgd.layout = g_bgl_u; bgd.entryCount = 2; bgd.entries = be;
     g_bg_u = wgpuDeviceCreateBindGroup(g_dev, &bgd);
     make_solid(&g_white, 255);
     make_solid(&g_black, 0);   /* pixel shaders sampling an empty stage read (0, 0, 0, 1) */
@@ -348,13 +391,16 @@ static void create_resources(void) {
 #ifndef __EMSCRIPTEN__
 int gpu_init_native(void) {
     if (g_dev) return 1;
-    if (!g_metal_layer) { fprintf(stderr, "[wgpu] no window\n"); return 0; }
+    /* RC_OFFSCREEN=1: no window; frames render into the back buffer only (screenshots, automated tests) */
+    if (!g_metal_layer && !getenv("RC_OFFSCREEN")) { fprintf(stderr, "[wgpu] no window\n"); return 0; }
     g_inst = wgpuCreateInstance(NULL);
-    WGPUSurfaceSourceMetalLayer ml = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;
-    ml.layer = g_metal_layer;
-    WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
-    sd.nextInChain = &ml.chain;
-    g_surface = wgpuInstanceCreateSurface(g_inst, &sd);
+    if (g_metal_layer) {
+        WGPUSurfaceSourceMetalLayer ml = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;
+        ml.layer = g_metal_layer;
+        WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
+        sd.nextInChain = &ml.chain;
+        g_surface = wgpuInstanceCreateSurface(g_inst, &sd);
+    }
 
     WGPURequestAdapterOptions ao = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
     ao.compatibleSurface = g_surface;
@@ -490,13 +536,22 @@ static WGPUSampler sampler_for(uint32_t key) {
 /* ------------------------------------------------------------------ pixel shaders */
 
 char *ps_to_wgsl(const uint32_t *code, uint32_t n, char *why, size_t why_n);
-typedef struct { WGPUShaderModule module; } PsProgram;
+/* id: 1-based index of the program's code among the distinct pixel shaders seen, the pipeline key's
+   shader part. The game creates its pixel shaders afresh for every match (new handles, same code), and
+   keying pipelines by handle filled the pipeline cache after a couple of matches. */
+typedef struct { WGPUShaderModule module; uint32_t id; const uint32_t *code; uint32_t code_len; } PsProgram;
+static PsProgram **g_ps_programs;
+static uint32_t g_nps_programs, g_cap_ps_programs;
 
 /* NULL when the shader can't be translated: such draws use the fixed-function stage instead */
 static PsProgram *ps_program(uint32_t handle) {
     Shader *sh = shader_get(handle);
     if (!sh || !sh->pixel) return NULL;
     if (sh->backend) return sh->backend == (void *)1 ? NULL : sh->backend;
+    for (uint32_t i = 0; i < g_nps_programs; i++) {   /* the same code as an earlier shader: share it */
+        PsProgram *p = g_ps_programs[i];
+        if (p->code_len == sh->code_len && !memcmp(p->code, sh->code, sh->code_len * 4)) { sh->backend = p; return p; }
+    }
     char why[96] = "";
     char *fs = ps_to_wgsl(sh->code, sh->code_len, why, sizeof why);
     if (!fs) {
@@ -508,19 +563,64 @@ static PsProgram *ps_program(uint32_t handle) {
     p->module = make_module(fs);
     if (getenv("RC_DUMP_PS")) fprintf(stderr, "[ps %x]\n%s", handle, fs);
     free(fs);
+    uint32_t *copy = malloc(sh->code_len * 4);   /* the game may free its shader; keep the code for matching */
+    memcpy(copy, sh->code, sh->code_len * 4);
+    p->code = copy; p->code_len = sh->code_len;
+    if (g_nps_programs == g_cap_ps_programs) {
+        g_cap_ps_programs = g_cap_ps_programs ? g_cap_ps_programs * 2 : 64;
+        g_ps_programs = realloc(g_ps_programs, g_cap_ps_programs * sizeof *g_ps_programs);
+    }
+    g_ps_programs[g_nps_programs++] = p;
+    p->id = g_nps_programs;
     sh->backend = p;
     return p;
 }
-static WGPUShaderModule module_for_ps(uint32_t ps) {
-    PsProgram *p = ps ? ps_program(ps) : NULL;
-    return p ? p->module : g_shader;
+/* id: a PsProgram id (the pipeline key's shader part), 0 for the fixed-function module */
+static WGPUShaderModule module_for_ps(uint32_t id) {
+    return id && id <= g_nps_programs ? g_ps_programs[id - 1]->module : g_shader;
+}
+
+/* ------------------------------------------------------------------ GPU vertex programs */
+
+typedef struct { WGPUShaderModule module; uint32_t nin, reg[16], stream[16], type[16], offset[16]; } GVs;
+static GVs **g_vs_programs;
+static uint32_t g_nvs_programs;
+
+static void exec_vs_program(const CmdVsProgram *c) {
+    if (c->id > g_nvs_programs) {
+        g_vs_programs = realloc(g_vs_programs, c->id * sizeof *g_vs_programs);
+        memset(g_vs_programs + g_nvs_programs, 0, (c->id - g_nvs_programs) * sizeof *g_vs_programs);
+        g_nvs_programs = c->id;
+    }
+    GVs *g = calloc(1, sizeof *g);
+    g->nin = c->ninputs;
+    memcpy(g->reg, c->in_reg, sizeof g->reg); memcpy(g->stream, c->in_stream, sizeof g->stream);
+    memcpy(g->type, c->in_type, sizeof g->type); memcpy(g->offset, c->in_offset, sizeof g->offset);
+    g->module = make_module((const char *)(c + 1));
+    g_vs_programs[c->id - 1] = g;
+}
+static GVs *vs_program(uint32_t id) { return id && id <= g_nvs_programs ? g_vs_programs[id - 1] : NULL; }
+
+static WGPUVertexFormat vs_input_format(uint32_t type) {
+    switch (type) {
+    case 0: return WGPUVertexFormat_Float32;   case 1: return WGPUVertexFormat_Float32x2;
+    case 2: return WGPUVertexFormat_Float32x3; case 3: return WGPUVertexFormat_Float32x4;
+    case 4: return WGPUVertexFormat_Unorm8x4;  case 5: return WGPUVertexFormat_Uint8x4;
+    case 6: return WGPUVertexFormat_Sint16x2;  default: return WGPUVertexFormat_Sint16x4;
+    }
 }
 
 /* ------------------------------------------------------------------ pipelines */
 
 static WGPUShaderModule module_for_ps(uint32_t ps);
-typedef struct { PKey k; WGPURenderPipeline p; } PEntry;
-static PEntry g_pipes[512];
+/* Pipelines, cached by their state key. The cache evicts the least recently used entry of a probe chain
+   when the chain is full: a full cache used to hand every new draw the pipeline in slot 0 (wrong
+   shader and blend state: black shadows, then missing players and field, a few matches in). */
+typedef struct { PKey k; WGPURenderPipeline p; uint32_t stamp; } PEntry;
+#define PIPE_CACHE 1024
+#define PIPE_PROBES 16
+static PEntry g_pipes[PIPE_CACHE];
+static uint32_t g_pipe_stamp;
 
 static WGPUBlendFactor bf(uint32_t b) {
     switch (b) {
@@ -543,6 +643,14 @@ static WGPUCompareFunction cmpf(uint32_t f) {
     case 7: return WGPUCompareFunction_GreaterEqual; default: return WGPUCompareFunction_Always;
     }
 }
+static WGPUStencilOperation sop(uint32_t o) {   /* D3DSTENCILOP */
+    switch (o) {
+    case 2: return WGPUStencilOperation_Zero;           case 3: return WGPUStencilOperation_Replace;
+    case 4: return WGPUStencilOperation_IncrementClamp; case 5: return WGPUStencilOperation_DecrementClamp;
+    case 6: return WGPUStencilOperation_Invert;         case 7: return WGPUStencilOperation_IncrementWrap;
+    case 8: return WGPUStencilOperation_DecrementWrap;  default: return WGPUStencilOperation_Keep;
+    }
+}
 static WGPUBlendOperation bop(uint32_t o) {
     switch (o) { case 2: return WGPUBlendOperation_Subtract; case 3: return WGPUBlendOperation_ReverseSubtract;
                  case 4: return WGPUBlendOperation_Min; case 5: return WGPUBlendOperation_Max;
@@ -552,10 +660,17 @@ static WGPUBlendOperation bop(uint32_t o) {
 static WGPURenderPipeline pipeline_for(const PKey *k) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < sizeof *k / 4; i++) h = (h ^ ((const uint32_t *)k)[i]) * 16777619u;
-    for (uint32_t i = 0; i < 512; i++) {
-        PEntry *e = &g_pipes[(h + i) % 512];
-        if (e->p && !memcmp(&e->k, k, sizeof *k)) return e->p;
-        if (!e->p) {
+    PEntry *victim = NULL;
+    for (uint32_t i = 0; i < PIPE_PROBES; i++) {
+        PEntry *e = &g_pipes[(h + i) % PIPE_CACHE];
+        if (e->p && !memcmp(&e->k, k, sizeof *k)) { e->stamp = ++g_pipe_stamp; return e->p; }
+        if (!victim || !e->p || (victim->p && e->stamp < victim->stamp)) victim = e;
+        if (!e->p) break;
+    }
+    {
+        PEntry *e = victim;
+        {
+            if (e->p) wgpuRenderPipelineRelease(e->p);   /* recorded draws keep their own reference */
             WGPUVertexAttribute at[7] = {
                 { NULL, WGPUVertexFormat_Float32x4, 0, 0 }, { NULL, WGPUVertexFormat_Uint32, 16, 1 },
                 { NULL, WGPUVertexFormat_Uint32, 20, 2 }, { NULL, WGPUVertexFormat_Float32x4, 24, 3 },
@@ -580,23 +695,51 @@ static WGPURenderPipeline pipeline_for(const PKey *k) {
             ds.format = WGPUTextureFormat_Depth24PlusStencil8;
             ds.depthWriteEnabled = k->zen && k->zwrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
             ds.depthCompare = k->zen ? cmpf(k->zfunc) : WGPUCompareFunction_Always;
+            if (k->sten) {   /* Direct3D 8 stencil is one-sided: the same state for both faces */
+                WGPUStencilFaceState f = WGPU_STENCIL_FACE_STATE_INIT;
+                f.compare = cmpf(k->sfunc);
+                f.failOp = sop(k->sfail); f.depthFailOp = sop(k->szfail); f.passOp = sop(k->spass);
+                ds.stencilFront = ds.stencilBack = f;
+                ds.stencilReadMask = k->smask; ds.stencilWriteMask = k->swmask;
+            }
             WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
             pd.layout = g_pl;
             pd.vertex.module = mod; pd.vertex.entryPoint = sv("vs");
             pd.vertex.bufferCount = 1; pd.vertex.buffers = &vbl;
+            /* GPU vertex program: one vertex buffer per stream, read as the game stored it */
+            GVs *gv = vs_program(k->vs);
+            WGPUVertexBufferLayout vbls[4];
+            WGPUVertexAttribute vat[4][16];
+            if (gv) {
+                uint32_t nbuf = 0;
+                for (uint32_t s = 0; s < 4; s++) {
+                    uint32_t stride = (k->strides[s / 2] >> (16 * (s & 1))) & 0xFFFF;
+                    vbls[s] = (WGPUVertexBufferLayout)WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+                    vbls[s].stepMode = WGPUVertexStepMode_Vertex;
+                    vbls[s].arrayStride = stride;
+                    uint32_t na = 0;
+                    for (uint32_t i = 0; i < gv->nin; i++)
+                        if (gv->stream[i] == s)
+                            vat[s][na++] = (WGPUVertexAttribute){ NULL, vs_input_format(gv->type[i]), gv->offset[i], gv->reg[i] };
+                    vbls[s].attributeCount = na; vbls[s].attributes = vat[s];
+                    if (stride) nbuf = s + 1;
+                }
+                pd.vertex.module = gv->module; pd.vertex.entryPoint = sv("vs_gpu");
+                pd.vertex.bufferCount = nbuf; pd.vertex.buffers = vbls;
+            }
             pd.primitive.topology = (WGPUPrimitiveTopology)k->topo;
             pd.primitive.frontFace = WGPUFrontFace_CW;
             pd.primitive.cullMode = k->cull == 2 ? WGPUCullMode_Front : k->cull == 3 ? WGPUCullMode_Back : WGPUCullMode_None;
             pd.depthStencil = &ds;
             pd.fragment = &fs;
-            pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
+            pd.multisample.count = k->samples ? k->samples : 1; pd.multisample.mask = 0xFFFFFFFFu;
             e->k = *k;
             e->p = wgpuDeviceCreateRenderPipeline(g_dev, &pd);
+            e->stamp = ++g_pipe_stamp;
+            g_gpu_pipelines_made++;
             return e->p;
         }
     }
-    fprintf(stderr, "[wgpu] pipeline cache full\n");
-    return g_pipes[0].p;
 }
 
 /* ------------------------------------------------------------------ frames and passes */
@@ -656,6 +799,8 @@ static void destroy_retired(void) {
 static void submit(void) {
     end_pass();
     if (g_enc) {
+        if (g_vpos) wgpuQueueWriteBuffer(g_queue, g_vbuf, 0, g_vstage, g_vpos);   /* multiples of 256 */
+        if (g_upos) wgpuQueueWriteBuffer(g_queue, g_ubuf, 0, g_ustage, g_upos);
         WGPUCommandBuffer cb = wgpuCommandEncoderFinish(g_enc, NULL);
         wgpuQueueSubmit(g_queue, 1, &cb);
         wgpuCommandBufferRelease(cb);
@@ -696,6 +841,14 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     da.stencilLoadOp = (clear & 4) ? WGPULoadOp_Clear : WGPULoadOp_Load;
     da.stencilStoreOp = WGPUStoreOp_Store;
     da.stencilClearValue = stencil;
+    g_pass_samples = 1;
+    g_pass_stencil_ref = 0;
+    if (ca.view == g_bb_view && g_bb_ms) {   /* anti-aliased back buffer: draw multisampled, resolve into g_bb */
+        ca.view = g_bb_ms_view;
+        ca.resolveTarget = g_bb_view;
+        da.view = g_depth_ms_view;
+        g_pass_samples = g_bb_samples;
+    }
     WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
     rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
     rp.depthStencilAttachment = &da;
@@ -739,6 +892,14 @@ static WGPUTextureView scratch_depth(uint32_t w, uint32_t h) {
 }
 
 static void exec_target(const CmdTarget *c) {
+    if (!c->color_id && c->msaa && c->msaa != g_bb_samples) {   /* the game changed its anti-aliasing setting */
+        end_pass();
+        g_bb_samples = c->msaa;
+        int was_bb = !g_tgt_color || g_tgt_color == g_bb_view;
+        make_depth();
+        if (was_bb) g_tgt_color = g_tgt_depth = NULL;
+        fprintf(stderr, "[wgpu] anti-aliasing: %ux\n", g_bb_samples);
+    }
     WGPUTextureView color, depth;
     GSurf *gs = NULL;
     uint32_t w, h;
@@ -915,11 +1076,47 @@ static void exec_clear(const CmdClear *c) {
     if (g_tgt_gs) g_tgt_gs->gpu_dirty = 1;
 }
 
+/* The vertex/index buffer binds of every draw. webgpu.h takes 64-bit offsets and sizes, which cross into the
+   browser's bindings as BigInt objects (four per draw, ~12,000 draws a second in a match); Safari's page-thread
+   collector can stall for minutes (README, "Memory in WebKit"), so that garbage would pile up at megabytes a
+   second. The rings are 32 MB: 32-bit arguments into the same WebGPU objects, no BigInt. size UINT32_MAX = the
+   rest of the buffer. */
+#ifdef __EMSCRIPTEN__
+EM_JS(void, rc_set_vertex_buffer, (WGPURenderPassEncoder pass, uint32_t slot, WGPUBuffer buf, uint32_t off, uint32_t size), {
+    size >>>= 0;   /* uint32_t arrives as a signed i32 */
+    WebGPU.getJsObject(pass).setVertexBuffer(slot, WebGPU.getJsObject(buf), off >>> 0, size === 0xffffffff ? undefined : size);
+});
+EM_JS(void, rc_set_index_buffer, (WGPURenderPassEncoder pass, WGPUBuffer buf, uint32_t format, uint32_t off, uint32_t size), {
+    WebGPU.getJsObject(pass).setIndexBuffer(WebGPU.getJsObject(buf), WebGPU.IndexFormat[format], off >>> 0, size >>> 0);
+});
+static void set_vertex_buffer(WGPURenderPassEncoder pass, uint32_t slot, WGPUBuffer buf, uint32_t off, uint32_t size) {
+    rc_set_vertex_buffer(pass, slot, buf, off, size);
+}
+static void set_index_buffer(WGPURenderPassEncoder pass, WGPUBuffer buf, WGPUIndexFormat fmt, uint32_t off, uint32_t size) {
+    rc_set_index_buffer(pass, buf, (uint32_t)fmt, off, size);
+}
+#else
+static void set_vertex_buffer(WGPURenderPassEncoder pass, uint32_t slot, WGPUBuffer buf, uint32_t off, uint32_t size) {
+    wgpuRenderPassEncoderSetVertexBuffer(pass, slot, buf, off, size == UINT32_MAX ? WGPU_WHOLE_SIZE : size);
+}
+static void set_index_buffer(WGPURenderPassEncoder pass, WGPUBuffer buf, WGPUIndexFormat fmt, uint32_t off, uint32_t size) {
+    wgpuRenderPassEncoderSetIndexBuffer(pass, buf, fmt, off, size);
+}
+#endif
+
 static void exec_draw(const CmdDraw *c) {
     begin_frame();
     if (!g_pass) begin_pass(0, 0, 1.f, 0);
     uint32_t n = c->nverts, bytes = n * (uint32_t)sizeof(CVert);
-    if (g_vpos + bytes > VBUF_SIZE || g_upos + USTRIDE > UBUF_SIZE) { submit(); begin_pass(0, 0, 1.f, 0); }
+    const uint8_t *payload = (const uint8_t *)(c + 1);
+    GVs *gv = c->key.vs ? vs_program(c->key.vs) : NULL;
+    if (c->key.vs && !gv) return;
+    if (gv) {   /* indices and stream data (everything after the constants) go to the vertex ring */
+        payload += VS_CONST_BYTES;
+        bytes = c->h.size - (uint32_t)sizeof *c - VS_CONST_BYTES;
+    }
+    uint32_t ustride = gv ? USTRIDE_VS : USTRIDE;
+    if (g_vpos + bytes > VBUF_SIZE || g_upos + ustride > UBUF_SIZE) { submit(); begin_pass(0, 0, 1.f, 0); }
 
     PsProgram *ps = c->key.ps ? ps_program(c->key.ps) : NULL;
     WGPUTextureView views[4];
@@ -934,8 +1131,9 @@ static void exec_draw(const CmdDraw *c) {
             views[s] = gs && !gs->depth && gs->view != g_tgt_color ? gs->view : g_black.view;
         }
     }
-    wgpuQueueWriteBuffer(g_queue, g_vbuf, g_vpos, c + 1, bytes);
-    wgpuQueueWriteBuffer(g_queue, g_ubuf, g_upos, &c->u, sizeof c->u);
+    memcpy(g_vstage + g_vpos, payload, bytes);
+    memcpy(g_ustage + g_upos, &c->u, sizeof c->u);
+    if (gv) memcpy(g_ustage + g_upos + 512, c + 1, VS_CONST_BYTES);
 
     WGPUBindGroupEntry te[8];
     for (int i = 0; i < 4; i++) {
@@ -965,7 +1163,8 @@ static void exec_draw(const CmdDraw *c) {
     }
 
     PKey k = c->key;
-    if (!ps) k.ps = 0;
+    k.ps = ps ? ps->id : 0;   /* by program, not handle: handles are new every match */
+    k.samples = g_pass_samples;
     WGPURenderPipeline p = pipeline_for(&k);
 
     float vx, vy, vw, vh;
@@ -976,17 +1175,50 @@ static void exec_draw(const CmdDraw *c) {
         if (vx + vw > g_tgt_w) vw = g_tgt_w - vx;
         if (vy + vh > g_tgt_h) vh = g_tgt_h - vy;
     }
+    /* Widescreen (render_cmd.h): the game's 640x480 screen as a 4:3 area, centred or at a side of the window */
+    if (c->layout != LAYOUT_STRETCH && !g_tgt_gs && g_tgt_w * 3 > g_tgt_h * 4 + 3) {
+        const float *v = c->u.vp;
+        float s = (float)g_tgt_h / (float)g_tgt_lh, x0 = ((float)g_tgt_w - (float)g_tgt_lw * s) / 2.f * (float)(1 + c->anchor);
+        float m[2];
+        if (c->layout == LAYOUT_43) {
+            /* 2D: the viewport spans the whole width and clip-space x is remapped (misc.zw), so what the game
+               draws left of 0 or right of 640 (its menus' backgrounds are wider) is still seen */
+            m[0] = v[2] * s / (float)g_tgt_w;
+            m[1] = 2.f * (x0 + (v[0] + v[2] / 2.f) * s) / (float)g_tgt_w - 1.f;
+            vx = 0; vw = (float)g_tgt_w;
+        } else {
+            /* 3D in part of the screen: its camera has the wide aspect ratio too, so x is narrowed back to 4:3 */
+            m[0] = (float)g_tgt_w / (float)g_tgt_h * 0.75f; m[1] = 0.f;
+            vx = x0 + v[0] * s; vw = v[2] * s;
+        }
+        memcpy(g_ustage + g_upos + offsetof(Uniforms, misc) + 8, m, 8);
+    }
     if (vw <= 0 || vh <= 0) return;
     wgpuRenderPassEncoderSetViewport(g_pass, vx, vy, vw, vh, c->minz, c->maxz);
     wgpuRenderPassEncoderSetPipeline(g_pass, p);
-    uint32_t off = g_upos;
-    wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 1, &off);
+    if (k.sten && c->stencil_ref != g_pass_stencil_ref) {
+        wgpuRenderPassEncoderSetStencilReference(g_pass, c->stencil_ref);
+        g_pass_stencil_ref = c->stencil_ref;
+    }
+    uint32_t off[2] = { g_upos, gv ? g_upos + 512 : 0 };
+    wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 2, off);
     wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL);   /* owned by the cache */
-    wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, g_vbuf, g_vpos, bytes);
-    wgpuRenderPassEncoderDraw(g_pass, n, 1, 0, 0);
+    if (gv) {
+        uint32_t base = g_vpos - VS_CONST_BYTES;   /* payload offsets count from the constants */
+        for (uint32_t s = 0; s < 4; s++) {
+            uint32_t stride = (c->key.strides[s / 2] >> (16 * (s & 1))) & 0xFFFF;
+            if (stride) set_vertex_buffer(g_pass, s, g_vbuf, base + c->vs_stream_off[s], UINT32_MAX);
+        }
+        uint32_t ib = n * (c->vs_index32 ? 4u : 2u);
+        set_index_buffer(g_pass, g_vbuf, c->vs_index32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, base + c->vs_idx_off, ib);
+        wgpuRenderPassEncoderDrawIndexed(g_pass, n, 1, 0, 0, 0);
+    } else {
+        set_vertex_buffer(g_pass, 0, g_vbuf, g_vpos, bytes);
+        wgpuRenderPassEncoderDraw(g_pass, n, 1, 0, 0);
+    }
     if (g_tgt_gs) g_tgt_gs->gpu_dirty = 1;
     g_vpos += (bytes + 255) & ~255u;
-    g_upos += USTRIDE;
+    g_upos += ustride;
 #ifndef __EMSCRIPTEN__
     if (c->capture_index >= 0) {
         /* frame capture: the back buffer after every draw, as /tmp/rc_cap/NNNN.png */
@@ -1003,26 +1235,48 @@ static void exec_draw(const CmdDraw *c) {
 /* ------------------------------------------------------------------ present */
 
 #ifndef __EMSCRIPTEN__
-static void pace_60hz(void) {
+static void pace_frame(void) {   /* refresh_hz(), 60 by default */
     static double next;
     double now = host_seconds();
     if (next == 0 || now - next > 0.1) next = now;
-    next += 1.0 / 60.0;
+    next += 1.0 / refresh_hz();
     if (next > now) usleep((useconds_t)((next - now) * 1e6));
 }
 #endif
 
+/* Frames presented with something drawn in them: the page keeps its loading screen up until the game shows
+   something (the first frames are clears while it loads; the EA intro that follows draws at the video's rate). */
+static uint32_t g_frames_drawn;
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+uint32_t rc_frames_drawn(void) { return g_frames_drawn; }
+
 static void exec_present(const CmdPresent *c) {
+    if (c->drawn) g_frames_drawn++;
     begin_frame();
     use_backbuffer();
     if (!g_pass && !g_enc) begin_pass(1, 0, 1.f, 0);   /* nothing drawn: present black */
     submit();
 #ifndef __EMSCRIPTEN__
-    if (c->screenshot) { char path[256]; snprintf(path, sizeof path, "/tmp/rc_frame_%u.png", c->frame); capture_png(path); }
+    if (c->screenshot) {   /* RC_SCREENSHOT_DIR overrides /tmp */
+        const char *dir = getenv("RC_SCREENSHOT_DIR");
+        char path[1024];
+        snprintf(path, sizeof path, "%s/rc_frame_%u.png", dir ? dir : "/tmp", c->frame);
+        capture_png(path);
+    }
 #else
     (void)c;
 #endif
     g_frame_open = 0;
+#ifndef __EMSCRIPTEN__
+    if (!g_surface) {   /* offscreen */
+        static int pace = -1;
+        if (pace < 0) pace = getenv("RC_PACE60") != NULL;
+        if (pace) pace_frame();
+        return;
+    }
+#endif
     /* copy the back buffer to the window */
     WGPUSurfaceTexture cur = WGPU_SURFACE_TEXTURE_INIT;
     wgpuSurfaceGetCurrentTexture(g_surface, &cur);
@@ -1054,10 +1308,10 @@ static void exec_present(const CmdPresent *c) {
 #ifndef __EMSCRIPTEN__
         wgpuSurfacePresent(g_surface);   /* FIFO: waits for vsync */
         wgpuTextureRelease(cur.texture);
-        /* RC_PACE60: fixed 60 Hz even on fast displays, so scripted input (RC_INPUT) is repeatable */
+        /* RC_PACE60: fixed refresh_hz() (60 by default) even on fast displays, so scripted input (RC_INPUT) is repeatable */
         static int pace = -1;
         if (pace < 0) pace = getenv("RC_PACE60") != NULL;
-        if (pace) pace_60hz();
+        if (pace) pace_frame();
 #else
         wgpuTextureRelease(cur.texture);   /* the browser presents the canvas when this task ends */
 #endif
@@ -1065,7 +1319,7 @@ static void exec_present(const CmdPresent *c) {
         if (cur.texture) wgpuTextureRelease(cur.texture);
 #ifndef __EMSCRIPTEN__
         if (cur.status != (WGPUSurfaceGetCurrentTextureStatus)0x00030001) configure_surface();  /* not just occluded */
-        pace_60hz();
+        pace_frame();
 #endif
     }
 }
@@ -1078,6 +1332,7 @@ void gpu_exec(const CmdHdr *h) {
     case CMD_TARGET: exec_target((const CmdTarget *)h); break;
     case CMD_CLEAR: exec_clear((const CmdClear *)h); break;
     case CMD_DRAW: exec_draw((const CmdDraw *)h); break;
+    case CMD_VS_PROGRAM: exec_vs_program((const CmdVsProgram *)h); break;
     case CMD_UPLOAD_TEX: exec_upload_tex((const CmdUploadTex *)h); break;
     case CMD_DESTROY_TEX: exec_destroy(((const CmdDestroy *)h)->id, 0); break;
     case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;
@@ -1154,6 +1409,7 @@ static int run_chunk(Chunk *ch) {
         case CMD_TARGET: exec_target((const CmdTarget *)h); break;
         case CMD_CLEAR: exec_clear((const CmdClear *)h); break;
         case CMD_DRAW: exec_draw((const CmdDraw *)h); break;
+    case CMD_VS_PROGRAM: exec_vs_program((const CmdVsProgram *)h); break;
         case CMD_UPLOAD_TEX: exec_upload_tex((const CmdUploadTex *)h); break;
         case CMD_DESTROY_TEX: exec_destroy(((const CmdDestroy *)h)->id, 0); break;
         case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;

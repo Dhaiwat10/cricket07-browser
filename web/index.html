@@ -2,132 +2,181 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Cricket 07</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Cricket 07">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#09090b">
+<!-- Inter is self-hosted (variable weight 400-700, SIL OFL: inter-LICENSE.txt): the page is cross-origin
+     isolated (COEP), and iOS Safari refuses the font from fonts.gstatic.com even though it opts in. -->
+<link rel="preload" href="inter-latin.woff2" as="font" type="font/woff2" crossorigin>
 <style>
+  @font-face {
+    font-family: "Inter"; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url(inter-latin.woff2) format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+      U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: "Inter"; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url(inter-latin-ext.woff2) format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+      U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
   :root {
-    --bg: #070b08; --fg: #eef4ef; --muted: #9fb3a5; --faint: #6f8576;
-    --accent: #34b866; --accent-hi: #45cf79; --ball: #d23a2f;
-    --card: rgba(255, 255, 255, .055); --card-hi: rgba(255, 255, 255, .09); --line: rgba(255, 255, 255, .12);
-    --field: rgba(0, 0, 0, .28); --radius: 14px;
+    --bg: #09090b; --fg: #f4f4f5; --muted: #a1a1aa; --faint: #71717a;
+    --accent: #4ade80; --accent-strong: #22c55e; --accent-soft: rgba(74, 222, 128, .1); --on-accent: #052e14;
+    --surface: rgba(255, 255, 255, .035); --surface-hi: rgba(255, 255, 255, .06);
+    --line: rgba(255, 255, 255, .08); --line-hi: rgba(255, 255, 255, .16);
+    --field: rgba(0, 0, 0, .3); --radius: 12px; --radius-sm: 8px;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
-    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    font: 14px/1.5 var(--sans); letter-spacing: -0.006em; font-optical-sizing: auto;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
   main { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 12px; padding: 16px; }
-  .credit { color: var(--muted); font-size: 13px; text-align: center; }
-  .credit a { color: var(--accent-hi); text-decoration: underline; text-underline-offset: 2px; }
-  .credit a:hover { color: var(--fg); }
-  /* The 4:3 stage is centred. On viewports wide enough to fit a side-panel reference without crowding
+  .credit { color: var(--faint); font-size: 12px; text-align: center; letter-spacing: 0; }
+  .credit a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line-hi); transition: color .15s, border-color .15s; }
+  .credit a:hover { color: var(--fg); border-color: var(--muted); }
+  /* The stage is 16:9 (widescreen, html.wide: see the script below) or 4:3, and centred. On viewports wide enough to fit a side-panel reference without crowding
      the stage, 440px is reserved symmetrically (220 each side) so the panel sits in that gap and the
      stage stays centred rather than off-set. On narrow viewports the panel is hidden and the stage uses
      the full width. The .kbd-off body class (set when the player dismisses the panel) frees the space. */
-  #stage { position: relative; width: min(100%, calc((100vh - 72px) * 4 / 3)); aspect-ratio: 4 / 3; background: #000;
-    border-radius: 12px; overflow: hidden; box-shadow: 0 30px 80px rgba(0, 0, 0, .55); }
+  :root { --ar-w: 4; --ar-h: 3; }
+  html.wide { --ar-w: 16; --ar-h: 9; }
+  #stage { position: relative; width: min(100%, calc((100vh - 72px) * var(--ar-w) / var(--ar-h)));
+    aspect-ratio: var(--ar-w) / var(--ar-h); background: #000;
+    border-radius: var(--radius); overflow: hidden; box-shadow: 0 0 0 1px var(--line), 0 24px 64px rgba(0, 0, 0, .5); }
   @media (min-width: 1120px) {
-    body:not(.kbd-off) #stage { width: min(calc(100% - 440px), calc((100vh - 72px) * 4 / 3)); }
+    body:not(.kbd-off) #stage { width: min(calc(100% - 440px), calc((100vh - 72px) * var(--ar-w) / var(--ar-h))); }
   }
-  canvas { width: 100%; height: 100%; display: block; cursor: none; }
+  canvas { width: 100%; height: 100%; display: block; cursor: none; outline: none; }   /* focused for the keys: no focus ring */
   .hidden { display: none !important; }
 
-  /* the launcher: a floodlit pitch behind the menus */
-  #panel { position: absolute; inset: 0; overflow: auto; display: grid; place-items: center; padding: 28px;
+  /* the launcher: a dark pitch with a soft floodlight from above */
+  #panel { position: absolute; inset: 0; overflow: auto; display: grid; place-items: center; align-content: safe center;
+    gap: 16px; padding: 28px;
     background:
-      radial-gradient(120% 80% at 50% -10%, rgba(255, 255, 255, .10), transparent 60%),
-      repeating-linear-gradient(90deg, rgba(255, 255, 255, .025) 0 9%, transparent 9% 18%),
-      radial-gradient(140% 120% at 50% 110%, #123d22 0%, #0b2414 45%, #060d08 100%); }
-  .view { width: min(100%, 560px); text-align: center; animation: rise .25s ease-out; }
-  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
-  @media (prefers-reduced-motion: reduce) { .view { animation: none; } }
+      radial-gradient(90% 60% at 50% -5%, rgba(74, 222, 128, .09), transparent 70%),
+      repeating-linear-gradient(90deg, rgba(255, 255, 255, .012) 0 9%, transparent 9% 18%),
+      linear-gradient(180deg, #0c110e 0%, #08090a 100%); }
+  .view { width: min(100%, 520px); text-align: center; }
+  /* the children rise, not the view: a transform on the view would make it the containing block of the
+     absolutely positioned Back button, which then jumps to the panel's corner when the animation ends */
+  .view > * { animation: rise .3s cubic-bezier(.2, .8, .2, 1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+  @media (prefers-reduced-motion: reduce) { .view > * { animation: none; } }
 
   .brand { margin: 0 auto 10px; font-size: 34px; font-weight: 800; letter-spacing: .02em; text-transform: uppercase; }
-  .tagline { margin: 0 0 26px; color: var(--muted); }
-  .small { font-size: 13px; color: var(--faint); }
+  .tagline { margin: 0 0 22px; color: var(--muted); }
+  .small { font-size: 12.5px; color: var(--faint); }
+  .title { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
   p { margin: 8px 0; }
+  b { font-weight: 600; }
 
   /* home: the two big choices */
-  .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   @media (max-width: 520px) { .choices { grid-template-columns: 1fr; } }
-  .choice { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 20px 18px; text-align: left;
-    border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--fg); font: inherit;
-    cursor: pointer; transition: transform .12s ease, background .12s ease, border-color .12s ease; }
-  .choice:hover { transform: translateY(-2px); background: var(--card-hi); border-color: rgba(255, 255, 255, .22); }
-  .choice:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 2px; }
-  .choice svg { width: 30px; height: 30px; color: var(--accent); }
-  .choice b { font-size: 18px; }
-  .choice span { color: var(--muted); font-size: 14px; }
+  .choice { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 16px; text-align: left;
+    border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); font: inherit;
+    cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+  .choice:hover { background: var(--surface-hi); border-color: var(--line-hi); }
+  .choice:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  .choice svg { width: 36px; height: 36px; padding: 8px; margin-bottom: 10px; border-radius: var(--radius-sm);
+    color: var(--accent); background: var(--accent-soft); }
+  .choice b { font-size: 15px; letter-spacing: -0.01em; }
+  .choice span { color: var(--muted); font-size: 13px; line-height: 1.45; }
 
   /* buttons and fields */
-  button { font: inherit; cursor: pointer; border-radius: 10px; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 11px 20px; border: 0;
-    background: var(--accent); color: #04110a; font-weight: 700; transition: background .12s ease; }
-  .btn:hover { background: var(--accent-hi); }
-  .btn:disabled { opacity: .45; cursor: default; background: var(--accent); }
-  .btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
-  .btn.ghost:hover { background: var(--card-hi); }
-  .back { position: absolute; top: 16px; left: 16px; padding: 6px 12px; border: 0; background: transparent; color: var(--muted); }
-  .back:hover { color: var(--fg); }
-  input, select { font: inherit; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: 10px;
-    padding: 10px 12px; min-width: 0; }
+  button { font: inherit; cursor: pointer; border-radius: var(--radius-sm); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 16px; border: 0;
+    background: var(--accent-strong); color: var(--on-accent); font-weight: 600; letter-spacing: -0.01em;
+    transition: background .15s ease; }
+  .btn:hover { background: var(--accent); }
+  .btn:disabled { opacity: .4; cursor: default; background: var(--accent-strong); }
+  .btn.ghost { background: var(--surface); color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+  .btn.ghost:hover { background: var(--surface-hi); border-color: var(--line-hi); }
+  /* the panel reaches under a phone's status bar (viewport-fit=cover): keep the button out of it */
+  .back { position: absolute; top: calc(env(safe-area-inset-top, 0px) + 14px); left: calc(env(safe-area-inset-left, 0px) + 14px);
+    padding: 6px 10px; border: 0; background: transparent; color: var(--muted); font-size: 13px; transition: color .15s, background .15s; }
+  .back:hover { color: var(--fg); background: var(--surface); }
+  html.touch .back { padding: 9px 14px; color: var(--fg); background: var(--surface); border: 1px solid var(--line); }
+  input, select { font: inherit; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 9px 12px; min-width: 0; transition: border-color .15s, box-shadow .15s; }
+  input:hover, select:hover { border-color: var(--line-hi); }
+  input:focus, select:focus { outline: none; border-color: rgba(74, 222, 128, .6); box-shadow: 0 0 0 3px rgba(74, 222, 128, .15); }
   input::placeholder { color: var(--faint); }
-  label.field { display: grid; gap: 6px; text-align: left; font-size: 13px; color: var(--muted); }
+  label.field { display: grid; gap: 6px; text-align: left; font-size: 12.5px; font-weight: 500; color: var(--muted); }
 
-  .card { padding: 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); text-align: left; }
-  .card h2 { margin: 0 0 4px; font-size: 16px; }
+  .card { padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); text-align: left; }
+  .card h2 { margin: 0 0 2px; font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; }
   .stack { display: grid; gap: 14px; }
-  .row { display: flex; gap: 10px; }
+  .row { display: flex; gap: 8px; }
   .row > input { flex: 1; }
-  .or { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 13px; }
+  .or { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; }
   .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-  #np-code { text-transform: uppercase; letter-spacing: .15em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  details { margin-top: 12px; color: var(--muted); font-size: 13px; }
+  #np-code { text-transform: uppercase; letter-spacing: .15em; font-family: var(--mono); }
+  details { margin-top: 12px; color: var(--muted); font-size: 12.5px; }
   details summary { cursor: pointer; width: fit-content; }
+  details summary:hover { color: var(--fg); }
   details label { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
   details select { flex: 1; padding: 7px 10px; }
-  .msg { min-height: 1.5em; color: #f2b8a8; font-size: 14px; }
+  .msg { min-height: 1.5em; color: #fca5a5; font-size: 13px; }
 
   /* lobby */
-  .code { font: 800 clamp(30px, 6vw, 42px)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .18em; margin: 6px 0 2px; }
-  .players { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-  .players li { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; background: var(--field); text-align: left; }
-  .players li.empty { color: var(--faint); border: 1px dashed var(--line); background: transparent; }
-  .avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; flex: none; font-weight: 700;
-    background: #1d5a33; color: #d8f5e2; }
+  .code { font: 700 clamp(28px, 6vw, 38px)/1 var(--mono); letter-spacing: .16em; margin: 6px 0 4px; }
+  .players { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  .players li { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: var(--radius-sm);
+    border: 1px solid var(--line); background: var(--surface); text-align: left; }
+  .players li.empty { color: var(--faint); border-style: dashed; background: transparent; }
+  .avatar { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; flex: none; font-weight: 600;
+    font-size: 13px; background: var(--accent-soft); color: var(--accent); }
   .players .who { flex: 1; min-width: 0; }
   .players .who b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .players .who small { color: var(--faint); }
-  .tag { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 99px;
-    background: var(--card-hi); color: var(--muted); }
-  .spinner { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line);
-    border-top-color: var(--accent); animation: spin .9s linear infinite; vertical-align: -1px; margin-right: 6px; }
+  .players .who small { color: var(--faint); font-size: 12px; }
+  .tag { font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line);
+    color: var(--muted); }
+  .spinner { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line-hi);
+    border-top-color: var(--accent); animation: spin .8s linear infinite; vertical-align: -1px; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(1turn); } }
 
   /* loading */
-  progress { width: min(100%, 320px); height: 8px; margin-top: 14px; appearance: none; border: 0; border-radius: 99px;
-    overflow: hidden; background: var(--field); }
-  progress::-webkit-progress-bar { background: var(--field); }
-  progress::-webkit-progress-value { background: var(--accent); border-radius: 99px; }
+  progress { width: min(100%, 280px); height: 4px; margin-top: 14px; appearance: none; border: 0; border-radius: 99px;
+    overflow: hidden; background: var(--surface-hi); }
+  progress::-webkit-progress-bar { background: var(--surface-hi); }
+  progress::-webkit-progress-value { background: var(--accent); border-radius: 99px; transition: width .2s ease; }
   progress::-moz-progress-bar { background: var(--accent); }
   #status { font-variant-numeric: tabular-nums; color: var(--muted); max-width: 52ch; margin-inline: auto; }
+  #status b { color: var(--fg); font-weight: 600; }
+  #status .small { display: block; margin-top: 12px; }
+  #status code { font: 12.5px var(--mono); color: var(--fg); background: var(--surface-hi); padding: 2px 6px; border-radius: 4px; user-select: all; }
+  #status .copy { padding: 2px 9px; font-size: 12px; vertical-align: 1px; margin-left: 2px; }
 
-  /* fullscreen: the stage fills the screen and the game letterboxes itself inside the canvas */
+  /* fullscreen: the stage fills the screen; the game fills it (widescreen) or letterboxes its 4:3 picture */
   #stage:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; box-shadow: none; }
   #stage:-webkit-full-screen { width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; }
-  #fs { position: absolute; right: 12px; bottom: 12px; z-index: 2; width: 40px; height: 40px; display: grid; place-items: center;
-    padding: 0; border: 1px solid rgba(255, 255, 255, .18); border-radius: 10px; background: rgba(0, 0, 0, .55); color: #fff;
-    backdrop-filter: blur(4px); opacity: 0; transition: opacity .25s ease; }
-  #fs svg { width: 20px; height: 20px; }
+  #fs { position: absolute; right: 12px; bottom: 12px; z-index: 2; width: 36px; height: 36px; display: grid; place-items: center;
+    padding: 0; border: 1px solid rgba(255, 255, 255, .14); border-radius: var(--radius-sm); background: rgba(9, 9, 11, .6); color: #fff;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); opacity: 0; transition: opacity .25s ease, background .15s; }
+  #fs svg { width: 18px; height: 18px; }
   #stage.awake #fs, #fs:focus-visible { opacity: 1; }
-  #fs:hover { background: rgba(0, 0, 0, .75); }
+  #fs:hover { background: rgba(9, 9, 11, .85); }
   #fstip { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 2; padding: 6px 14px; border-radius: 99px;
-    background: rgba(0, 0, 0, .65); color: #fff; font-size: 13px; pointer-events: none; transition: opacity .4s ease; }
-  kbd { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 6px; border-radius: 5px;
-    border: 1px solid rgba(255, 255, 255, .25); background: rgba(255, 255, 255, .08); }
-  #netstatus { position: absolute; top: 10px; right: 10px; padding: 4px 10px; border-radius: 99px; background: rgba(0, 0, 0, .6);
-    color: #fff; font: 12px/1.5 ui-sans-serif, system-ui, sans-serif; pointer-events: none; backdrop-filter: blur(4px); }
-  #netstatus.bad { background: rgba(170, 20, 20, .88); }
+    background: rgba(9, 9, 11, .75); color: #fff; font-size: 12.5px; pointer-events: none; transition: opacity .4s ease;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 1px solid var(--line); }
+  kbd { display: inline-block; min-width: 20px; text-align: center; font: 500 11px/1.5 var(--sans); letter-spacing: 0;
+    padding: 0 5px; border-radius: 5px; border: 1px solid var(--line-hi); border-bottom-width: 2px;
+    background: var(--surface-hi); color: var(--fg); vertical-align: 1px; }
+  #netstatus { position: absolute; top: 10px; right: 10px; padding: 4px 10px; border-radius: 99px; background: rgba(9, 9, 11, .7);
+    color: #fff; font: 500 12px/1.5 var(--sans); pointer-events: none; backdrop-filter: blur(8px); border: 1px solid var(--line); }
+  #netstatus.bad { background: rgba(185, 28, 28, .9); border-color: transparent; }
 
   /* keyboard cheat sheet: shows beside the stage when the viewport has room, because in-game prompts
      use controller glyphs (triangle/circle/×/square, L1, R1) that keyboard players would otherwise have
@@ -135,51 +184,220 @@
   #kbd { position: fixed; top: 50%; right: 14px; transform: translateY(-50%); z-index: 2;
     width: 204px; max-height: calc(100vh - 24px); overflow: auto;
     padding: 12px 14px 14px; border: 1px solid var(--line); border-radius: var(--radius);
-    background: rgba(10, 18, 12, .78); color: var(--fg); font-size: 13px; line-height: 1.45;
-    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-    box-shadow: 0 20px 50px rgba(0, 0, 0, .5); display: none; }
+    background: rgba(14, 14, 16, .8); color: var(--fg); font-size: 12.5px; line-height: 1.45;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, .4); display: none; }
   @media (min-width: 1120px) {
     body:not(.kbd-off) #stage:not(:fullscreen) ~ #kbd { display: block; }
     body.kbd-off #stage:not(:fullscreen) ~ #kbd-show { display: grid; }
   }
   #kbd .kbd-head { display: flex; justify-content: space-between; align-items: center;
-    margin: -4px 0 10px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
-  #kbd .kbd-head b { font-size: 13px; letter-spacing: .02em; }
-  #kbd-close { background: transparent; border: 0; color: var(--muted); font-size: 20px; line-height: 1;
-    padding: 0 4px; cursor: pointer; border-radius: 6px; }
-  #kbd-close:hover { color: var(--fg); background: var(--card-hi); }
-  #kbd h3 { font: 600 11px/1.4 ui-sans-serif, system-ui, sans-serif; text-transform: uppercase;
-    letter-spacing: .08em; color: var(--muted); margin: 12px 0 4px; }
+    margin: -2px 0 10px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  #kbd .kbd-head b { font-size: 13px; letter-spacing: -0.01em; }
+  #kbd-close { background: transparent; border: 0; color: var(--faint); font-size: 18px; line-height: 1;
+    width: 24px; height: 24px; padding: 0; cursor: pointer; border-radius: 6px; }
+  #kbd-close:hover { color: var(--fg); background: var(--surface-hi); }
+  #kbd h3 { font: 500 11px/1.4 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); margin: 14px 0 4px; }
   #kbd h3:first-of-type { margin-top: 0; }
-  #kbd .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center;
-    padding: 4px 0; }
+  #kbd .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 3px 0; }
   #kbd .label { color: var(--muted); font-size: 12.5px; }
-  #kbd .keys { display: flex; flex-wrap: wrap; gap: 3px; justify-content: flex-end;
-    color: var(--muted); font-size: 11.5px; }
-  #kbd kbd { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 6px;
-    border-radius: 5px; border: 1px solid rgba(255, 255, 255, .22); background: rgba(255, 255, 255, .07);
-    color: var(--fg); white-space: nowrap; }
+  #kbd .keys { display: flex; flex-wrap: wrap; gap: 3px; justify-content: flex-end; color: var(--faint); font-size: 11px; }
   #kbd .note { color: var(--faint); font-size: 11.5px; margin: 4px 0 0; }
   #kbd-show { position: fixed; top: 50%; right: 16px; transform: translateY(-50%); z-index: 2;
-    width: 38px; height: 38px; place-items: center; padding: 0;
-    background: rgba(10, 18, 12, .78); color: var(--muted); border: 1px solid var(--line);
-    border-radius: 10px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: none; }
-  #kbd-show:hover { color: var(--fg); background: rgba(10, 18, 12, .92); }
+    width: 36px; height: 36px; place-items: center; padding: 0;
+    background: rgba(14, 14, 16, .8); color: var(--muted); border: 1px solid var(--line);
+    border-radius: var(--radius-sm); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); display: none; }
+  #kbd-show:hover { color: var(--fg); border-color: var(--line-hi); }
   #kbd-show svg { width: 18px; height: 18px; }
+
+  /* touch (phones and tablets, html.touch: see the script below): the stage fills the screen up to 16:9 (the
+     menus' backgrounds end not far past that, so a longer phone gets black bars), and once the game runs
+     (html.playing) on-screen controls sit over the bottom corners of the screen. Held upright, the picture keeps
+     its shape at the top and the controls go below it. web/loader.js (setupTouch) maps them to keys. */
+  /* --app-h: the screen's height. An iPhone home screen app can lay the page out shorter than the screen in
+     landscape (a band at the bottom), so web/loader.js (fitScreen) sets it from the screen there. */
+  html.touch { --app-h: 100dvh; touch-action: manipulation; }   /* no double-tap zoom (pinch: the viewport tag) */
+  html.touch, html.touch body { overflow: hidden; overscroll-behavior: none; }
+  html.touch #stage { position: fixed; inset: 0; bottom: auto; margin: 0 auto;
+    width: min(100%, calc(var(--app-h) * var(--ar-w) / var(--ar-h))); height: var(--app-h); aspect-ratio: auto; border-radius: 0; box-shadow: none; }
+  html.touch canvas { touch-action: none; }
+  html.touch #kbd, html.touch #kbd-show, html.touch #fstip, html.touch.playing .credit, html.touch .fs-hint,
+  html.touch .kbd-hint { display: none !important; }
+  .touch-hint { display: none; }
+  html.touch .touch-hint { display: inline; }
+  /* from Play until the game runs (web/loader.js: bootStep / bootDone): not a black screen */
+  #boot { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; text-align: center; padding: 24px;
+    background: radial-gradient(90% 60% at 50% -5%, rgba(74, 222, 128, .09), transparent 70%), var(--bg); }
+  #boot .boot-box { display: grid; justify-items: center; gap: 14px; max-width: 40ch; }
+  #boot img { width: min(46vw, 260px); height: auto; }
+  #boot-msg { color: var(--fg); font-size: 14px; font-weight: 500; }
+  #boot-hint { color: var(--muted); font-size: 12.5px; margin: 0; }
+  #boot .bar { width: min(60vw, 220px); height: 3px; border-radius: 99px; background: var(--surface-hi); overflow: hidden; }
+  #boot .bar::after { content: ""; display: block; width: 40%; height: 100%; border-radius: 99px; background: var(--accent);
+    animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  html.booting #touch, html.booting #fs { display: none !important; }
+
+  /* touch: until the game is fullscreen and sideways, this covers the screen (web/loader.js: updateGate) */
+  #gate { position: fixed; inset: 0; z-index: 5; bottom: auto; height: var(--app-h, 100%); display: grid; place-items: center; padding: 24px;
+    padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+      max(24px, env(safe-area-inset-left));
+    background: radial-gradient(90% 60% at 50% -5%, rgba(74, 222, 128, .09), transparent 70%), var(--bg);
+    text-align: center; touch-action: none; }
+  #gate .gate-box { max-width: 36ch; display: grid; justify-items: center; gap: 10px; }
+  #gate .gate-logo { margin-bottom: 6px; }
+  #gate h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+  #gate-text { color: var(--muted); font-size: 14px; }
+  #gate-text b { color: var(--fg); font-weight: 600; }
+  #gate svg.inline { width: 17px; height: 17px; vertical-align: -3px; }
+  #gate ol, #status ol { margin: 14px 0 0; padding: 0; list-style: none; counter-reset: step; display: grid; gap: 10px; text-align: left; }
+  #gate li, #status li { counter-increment: step; display: grid; grid-template-columns: 24px 1fr; gap: 10px; align-items: start; }
+  #gate li::before, #status li::before { content: counter(step); width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--accent-soft); color: var(--accent); font: 600 12px/1 var(--sans); margin-top: -1px; }
+  #status ol.options li::before { content: counter(step, upper-alpha); }
+  #gate .gate-rotate { display: none; width: 56px; height: 56px; color: var(--accent); }
+  #gate[data-state="rotate"] .gate-rotate { display: block; animation: turn 2.4s ease-in-out infinite; }
+  #gate[data-state="rotate"] .gate-logo { display: none; }
+  @keyframes turn { 0%, 30% { transform: rotate(0); } 60%, 100% { transform: rotate(-90deg); } }
+  #gate .btn { margin-top: 8px; }
+  /* touch, in a browser tab: how to play fullscreen (web/loader.js: setupInstall) */
+  #install { max-width: 46ch; justify-self: center; padding: 10px 14px; border: 1px solid var(--line);
+    border-radius: var(--radius); background: var(--surface); color: var(--muted); font-size: 13px; text-align: center; }
+  #install b { color: var(--fg); font-weight: 600; }
+  #install svg { width: 15px; height: 15px; vertical-align: -2px; }
+  #install .btn { margin-top: 10px; }
+  /* opened from the home screen: already fullscreen (Android) or as close as the system allows (iOS) */
+  @media (display-mode: fullscreen), (display-mode: standalone) { #fs, #install { display: none !important; } }
+  #panel:has(#view-online:not(.hidden), #view-lobby:not(.hidden)) #install { display: none; }
+  @media (orientation: portrait) {
+    html.touch.playing #stage { bottom: auto; width: 100%; height: auto; aspect-ratio: var(--ar-w) / var(--ar-h); }
+  }
+  #touch { display: none; }
+  html.touch.playing #touch { display: block; position: fixed; inset: 0; bottom: auto; height: var(--app-h); z-index: 3; pointer-events: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #touch > * { position: absolute; pointer-events: auto; touch-action: none; }
+  #touch button { pointer-events: auto; touch-action: none; padding: 0; color: #fff; font: 600 13px/1 var(--sans);
+    background: rgba(9, 9, 11, .32); border: 1.5px solid rgba(255, 255, 255, .28);
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); transition: background .08s, transform .08s; }
+  #touch button.on { background: rgba(255, 255, 255, .32); transform: scale(.94); }
+  #tpad { left: calc(env(safe-area-inset-left) + 18px); bottom: calc(env(safe-area-inset-bottom) + 18px);
+    width: 132px; height: 132px; border-radius: 50%; background: rgba(9, 9, 11, .28);
+    border: 1.5px solid rgba(255, 255, 255, .22); }
+  /* menus (html.menu): a d-pad in the stick's place */
+  #tdpad { left: calc(env(safe-area-inset-left) + 18px); bottom: calc(env(safe-area-inset-bottom) + 18px);
+    width: 144px; height: 144px; }
+  html.menu #tpad, html:not(.menu) #tdpad { display: none; }
+  #tdpad [data-dir] { position: absolute; width: 48px; height: 48px; display: grid; place-items: center;
+    background: rgba(9, 9, 11, .38); border: 1.5px solid rgba(255, 255, 255, .28); color: rgba(255, 255, 255, .8);
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); transition: background .08s; }
+  #tdpad [data-dir].on { background: rgba(255, 255, 255, .34); }
+  #tdpad [data-dir] svg { width: 18px; height: 18px; }
+  #tdpad [data-dir="ArrowUp"] { left: 48px; top: 0; border-radius: 10px 10px 4px 4px; }
+  #tdpad [data-dir="ArrowDown"] { left: 48px; bottom: 0; border-radius: 4px 4px 10px 10px; }
+  #tdpad [data-dir="ArrowLeft"] { left: 0; top: 48px; border-radius: 10px 4px 4px 10px; }
+  #tdpad [data-dir="ArrowRight"] { right: 0; top: 48px; border-radius: 4px 10px 10px 4px; }
+  #tdpad .hub { position: absolute; left: 48px; top: 48px; width: 48px; height: 48px; background: rgba(9, 9, 11, .38); }
+  #tpad svg { position: absolute; inset: 0; width: 100%; height: 100%; color: rgba(255, 255, 255, .5); }
+  #tpad .knob { position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px;
+    border-radius: 50%; background: rgba(255, 255, 255, .26); border: 1.5px solid rgba(255, 255, 255, .35); }
+  /* the letter keys under the right thumb; the modifiers in the top corners, under the index fingers like a
+     pad's shoulder buttons, so a lofted shot (Shift held through S) is two fingers, not one thumb on two keys.
+     Ctrl over Space (bowling) at the top left, Shift over Alt at the top right: a column at the edge, which on a
+     long phone keeps them in the bars beside the picture, off the game's camera inset and fielding radar. */
+  #tbtns { right: calc(env(safe-area-inset-right) + 14px); bottom: calc(env(safe-area-inset-bottom) + 14px);
+    width: 160px; height: 160px; pointer-events: none; }
+  #tbtns .face { position: absolute; width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; }
+  #tbtns .face { font-size: 21px; font-weight: 600; }   /* the keyboard keys they press (the game shows a keyboard) */
+  #tbtns .face[data-code="KeyW"] { left: 53px; top: 0; }
+  #tbtns .face[data-code="KeyA"] { left: 0; top: 53px; }
+  #tbtns .face[data-code="KeyD"] { right: 0; top: 53px; }
+  #tbtns .face[data-code="KeyS"] { left: 53px; top: 106px; }
+  #tleft, #tright { top: calc(env(safe-area-inset-top) + 10px); display: flex; flex-direction: column; align-items: center;
+    gap: 8px; pointer-events: none; }
+  #tleft { left: calc(env(safe-area-inset-left) + 12px); }
+  #tright { right: calc(env(safe-area-inset-right) + 12px); }
+  #tleft button, #tright button { width: 50px; height: 50px; border-radius: 50%; font-size: 13px; }
+  #tleft button:first-child, #tright button:first-child { width: 58px; height: 58px; font-size: 15px; }
+  #tright button[data-code="ShiftLeft"] { width: 84px; height: 84px; font-size: 18px; }   /* held through every lofted shot */
+  /* Esc and Enter at the top centre. Enter is the game's own key for Done on the on-screen keyboard (naming a
+     profile or a save), where S types a letter. */
+  #tmid { top: calc(env(safe-area-inset-top) + 8px); left: 50%; transform: translateX(-50%); display: flex; gap: 10px;
+    pointer-events: none; }
+  #tmid button { width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; }
+  html.touch #fs { display: none; }   /* fullscreen is not optional on a phone (the gate below) */
 </style>
 
+<script>
+  // Widescreen unless ?4x3: the stage is 16:9 and the game fills it (web/loader.js; online play stays 4:3).
+  if (!new URLSearchParams(location.search).has("4x3")) document.documentElement.classList.add("wide");
+  // On-screen controls when the main pointer is a finger, or with ?touch=1 (never with ?touch=0).
+  (function () {
+    var t = new URLSearchParams(location.search).get("touch");
+    if (t === "1" || (t !== "0" && window.matchMedia && matchMedia("(pointer: coarse)").matches))
+      document.documentElement.classList.add("touch");
+  })();
+</script>
 </head>
 <body>
 <main>
   <div id="stage">
     <canvas id="canvas" width="1024" height="768" tabindex="0"></canvas>
     <div id="netstatus" class="hidden"></div>
+    <div id="boot" class="hidden" role="status" aria-live="polite">
+      <div class="boot-box">
+        <div class="brand">Cricket 07</div>
+        <div class="bar"></div>
+        <div id="boot-msg"></div>
+        <p id="boot-hint" class="hidden">Still loading. On a phone this can take up to a minute.</p>
+      </div>
+    </div>
     <button id="fs" title="Fullscreen (Alt+Enter)" aria-label="Toggle fullscreen">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path id="fs-icon" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </button>
+    <div id="touch" aria-hidden="true">
+      <div id="tpad"><svg viewBox="0 0 132 132" fill="currentColor"><path d="M66 10l7 9h-14zM66 122l7-9h-14zM10 66l9-7v14zM122 66l-9-7v14z"/></svg><div class="knob"></div></div>
+      <div id="tdpad">
+        <div data-dir="ArrowUp"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 6l7 10H5z"/></svg></div>
+        <div data-dir="ArrowLeft"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 12l10-7v14z"/></svg></div>
+        <div class="hub"></div>
+        <div data-dir="ArrowRight"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 12L8 5v14z"/></svg></div>
+        <div data-dir="ArrowDown"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 18l7-10H5z"/></svg></div>
+      </div>
+      <div id="tleft">
+        <button class="shoulder" data-code="ControlLeft" tabindex="-1">Ctrl</button>
+        <button data-code="Space" tabindex="-1">Space</button>
+      </div>
+      <div id="tright">
+        <button class="shoulder" data-code="ShiftLeft" tabindex="-1">Shift</button>
+        <button class="shoulder" data-code="AltLeft" tabindex="-1">Alt</button>
+      </div>
+      <div id="tbtns">
+        <button class="face" data-code="KeyW" tabindex="-1">W</button>
+        <button class="face" data-code="KeyA" tabindex="-1">A</button>
+        <button class="face" data-code="KeyD" tabindex="-1">D</button>
+        <button class="face" data-code="KeyS" tabindex="-1">S</button>
+      </div>
+      <div id="tmid">
+        <button id="tpause" data-code="Escape" tabindex="-1">Esc</button>
+        <button data-code="Enter" tabindex="-1">Enter</button>
+      </div>
+    </div>
+    <div id="gate" class="hidden" role="dialog" aria-modal="true" aria-labelledby="gate-title">
+      <div class="gate-box">
+        <div class="gate-logo brand">Cricket 07</div>
+        <svg class="gate-rotate" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/></svg>
+        <h2 id="gate-title"></h2>
+        <div id="gate-text"></div>
+        <button id="gate-btn" class="btn hidden" type="button"></button>
+      </div>
+    </div>
     <div id="fstip" class="hidden">Press <kbd>Alt</kbd> + <kbd>Enter</kbd> for fullscreen</div>
     <div id="panel">
+      <!-- touch, in a browser tab: how to play fullscreen (filled in by web/loader.js: setupInstall). At the top, so
+           a phone shows it without scrolling, and on iOS before the download starts. -->
+      <div id="install" class="hidden"></div>
 
       <!-- loading: browser checks, the first-visit download, errors -->
       <section id="view-loading" class="view">
@@ -213,8 +431,8 @@
             <span>Online 1v1 with a friend, wherever they are.</span>
           </button>
         </div>
-        <p class="small" style="margin-top:22px">Use a controller, or the keyboard: arrows to move, S to select.<br>
-          Fullscreen: <kbd>Alt</kbd> + <kbd>Enter</kbd> (<kbd>⌥</kbd> + <kbd>Enter</kbd> on Mac) or the button in the corner.</p>
+        <p class="small" style="margin-top:22px"><span class="kbd-hint">Use a controller, or the keyboard: arrows to move, S to select.</span><span class="touch-hint">On-screen controls appear once the game starts; a controller works too.</span><span class="fs-hint"><br>
+          Fullscreen: <kbd>Alt</kbd> + <kbd>Enter</kbd> (<kbd>⌥</kbd> + <kbd>Enter</kbd> on Mac) or the button in the corner.</span></p>
         <p class="small"><a href="#" id="reset">Use a different game folder</a></p>
       </section>
 
@@ -223,7 +441,7 @@
         <button class="back" data-go="home">← Back</button>
         <div class="stack">
           <div>
-            <h2 style="margin:0;font-size:24px">Play Multiplayer</h2>
+            <h2 class="title">Play Multiplayer</h2>
             <p class="small" style="margin:4px 0 0">Online 1v1. Each player needs a controller or the keyboard.</p>
           </div>
           <label class="field">Your name
@@ -257,6 +475,7 @@
             </div>
           </div>
           <p id="np-msg" class="msg"></p>
+          <button id="np-retry" class="btn ghost hidden" style="justify-self:center">Try the download again</button>
         </div>
       </section>
 

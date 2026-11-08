@@ -9,6 +9,7 @@ Usage:
   x86toc.py <exe> <functions.json> <outdir> [--roots 0x67a97a,0x67aa76 | --all] [--per-file N]
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -406,8 +407,10 @@ class FunctionTranslator:
                     for ins, stmt in body]
         cache = RegisterCache(body)
         texts = cache.run()
-        lines = [f"void f_{self.entry:08x}(CPU *c) {{ /* {self.f['name']} */", "    PREEMPT_POLL(c);",
-                 f"    {cache.load()}"]
+        lines = [f"void f_{self.entry:08x}(CPU *c) {{ /* {self.f['name']} */", "    PREEMPT_POLL(c);"]
+        if self.entry in self.p.entry_hooks:
+            lines.append(f"    {self.p.entry_hooks[self.entry]}(c);")
+        lines.append(f"    {cache.load()}")
         for (ins, _), stmt in zip(body, texts):
             if ins is not None:
                 if ins.address in self.labels:
@@ -1198,11 +1201,13 @@ class FunctionTranslator:
 
 
 class Program:
-    def __init__(self, exe, functions_json):
+    def __init__(self, exe, functions_json, patches=None):
         pe = pefile.PE(exe, fast_load=True)
         self.base = pe.OPTIONAL_HEADER.ImageBase
-        self.img = pe.get_memory_mapped_image()
+        patches = patches or os.path.join(os.path.dirname(functions_json), "patches.json")
+        self.img = self.apply_patches(bytearray(pe.get_memory_mapped_image()), patches)
         d = json.load(open(functions_json))
+        self.entry_hooks = self.load_entry_hooks(patches)
         self.functions = {f["entry"]: f for f in d["functions"] if f["ranges"]}
         self.entries = set(self.functions)
         self.ghidra_entries = set(self.entries)  # real function starts; only these bound decoding
@@ -1211,6 +1216,32 @@ class Program:
         self.md.detail = True
         self.trace = False
         self.add_pointer_entries(pe)
+
+    def apply_patches(self, img, path):
+        """Byte patches to the game's code (--patches, e.g. profiles/cricket07.patches.json): fixes for bugs in the original game. Each entry
+        names the original bytes (or their SHA-256), so a patch that doesn't match the executable stops the build."""
+        if not os.path.exists(path):
+            return bytes(img)
+        for p in json.load(open(path))["patches"]:
+            a = int(p["addr"], 16) - self.base
+            new = bytes.fromhex(p["new"])
+            if "old" in p:   # the original bytes
+                old = bytes.fromhex(p["old"])
+                if img[a:a + len(old)] != old:
+                    raise SystemExit(f"patch at {p['addr']}: expected {p['old']}, found {img[a:a + len(old)].hex()}")
+            else:            # longer ones by their SHA-256, so the file holds none of the game's code
+                found = hashlib.sha256(bytes(img[a:a + p["old_len"]])).hexdigest()
+                if found != p["old_sha256"]:
+                    raise SystemExit(f"patch at {p['addr']}: the executable's bytes there don't match (another version?)")
+            img[a:a + len(new)] = new
+        return bytes(img)
+
+    def load_entry_hooks(self, path):
+        """Host functions called on entry to a game function (the patches file's "entry_hooks"), before its first
+        instruction, with the CPU state as the caller left it: {entry address: C function name}."""
+        if not os.path.exists(path):
+            return {}
+        return {int(h["addr"], 16): h["call"] for h in json.load(open(path)).get("entry_hooks", [])}
 
     def add_pointer_entries(self, pe):
         """Code reached only through pointers Ghidra never turned into functions (callbacks passed as
@@ -1393,10 +1424,17 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--per-file", type=int, default=400)
     ap.add_argument("--trace", action="store_true", help="call trace_insn() before every instruction")
+    ap.add_argument("--patches", help="byte patches and entry hooks for this game (default: patches.json next to "
+                    "functions.json, if any)")
     a = ap.parse_args()
 
-    prog = Program(a.exe, a.functions_json)
+    prog = Program(a.exe, a.functions_json, a.patches)
     prog.trace = a.trace
+    # a hook on an address that isn't a function entry would never run (the browser's lazy archive views then read
+    # unfilled memory without an error): stop the build instead
+    bad_hooks = [f"0x{h:x}" for h in prog.entry_hooks if h not in prog.entries]
+    if bad_hooks:
+        raise SystemExit(f"entry_hooks: not a function entry: {', '.join(bad_hooks)}")
     if a.all:
         chosen = set(prog.entries)
     else:
@@ -1433,6 +1471,7 @@ def main():
 
     hdr = ['#include "runtime.h"', '#include "simd.h"', '#include <math.h>', ""]
     hdr += [f"void f_{e:08x}(CPU *c);" for e in sorted(prog.entries)]
+    hdr += [f"void {h}(CPU *c);" for h in sorted(set(prog.entry_hooks.values()))]
     with open(os.path.join(a.outdir, "recomp.h"), "w") as f:
         f.write("#ifndef RECOMP_H\n#define RECOMP_H\n" + "\n".join(hdr) + "\n#endif\n")
     for i, ch in enumerate(chunks):

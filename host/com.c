@@ -47,6 +47,8 @@ static uint32_t build_vtable(ComInterface *it) {
     return vt;
 }
 
+int com_live_count(void) { return g_nobjs - 1 - g_nfree; }   /* for the [mem] log */
+
 uint32_t com_new(ComInterface *it, int type, void *data) {
     pthread_mutex_lock(&g_com_lock);
     uint32_t vt = build_vtable(it);
@@ -85,9 +87,11 @@ void com_AddRef(CPU *c) {
     RET(1, o ? (uint32_t)++o->refs : 1);
 }
 
-void com_Release(CPU *c) {
-    ComObj *o = com_get(THIS);
-    if (!o) RET(1, 0);
+/* Drops one reference and frees the object when none remain. IUnknown::Release, and host code that holds
+   references of its own (a texture's level surfaces). Returns the remaining count. */
+uint32_t com_release(uint32_t g) {
+    ComObj *o = com_get(g);
+    if (!o) return 0;
     int32_t r = --o->refs;
     if (r <= 0 && !o->iface->destroy) o->refs = r = 0;  /* singletons (devices, interfaces): keep alive */
     else if (r <= 0) {
@@ -103,5 +107,7 @@ void com_Release(CPU *c) {
         g_free_idx[g_nfree++] = (int)(o - g_objs);
         pthread_mutex_unlock(&g_com_lock);
     }
-    RET(1, (uint32_t)r);
+    return (uint32_t)r;
 }
+
+void com_Release(CPU *c) { RET(1, com_release(THIS)); }

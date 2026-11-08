@@ -124,9 +124,26 @@ int window_create(const char *title) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 0;
     }
-    g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, g_window_w, g_window_h,
+    /* Window size (points) from remaster.cfg's `window`: fullscreen, WxH, or by default 85% of the display
+       (widescreen) or the largest 4:3 window that fits in that (the renderer draws at the drawable size, so this is
+       the picture's resolution: on a Retina screen the drawable is twice the points). RC_FULLSCREEN=1 still
+       forces fullscreen. */
+    extern const char *settings_window(void);
+    const char *wset = settings_window();
+    int fullscreen = getenv("RC_FULLSCREEN") || !strcmp(wset, "fullscreen");
+    int ww = 0, wh = 0;
+    if (sscanf(wset, "%dx%d", &ww, &wh) != 2 || ww < 320 || wh < 240) {
+        SDL_Rect r;
+        ww = 1024; wh = 768;
+        if (SDL_GetDisplayUsableBounds(0, &r) == 0 && r.w > 0 && r.h > 0) {
+            extern int settings_widescreen(void);
+            wh = r.h * 85 / 100; ww = settings_widescreen() ? r.w * 85 / 100 : wh * 4 / 3;
+            if (ww > r.w * 85 / 100) { ww = r.w * 85 / 100; wh = ww * 3 / 4; }
+        }
+    }
+    g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ww, wh,
                                 SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
-                                (getenv("RC_FULLSCREEN") ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+                                (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!g_window) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 0; }
     SDL_RaiseWindow(g_window);
     disable_app_nap();
@@ -134,7 +151,7 @@ int window_create(const char *title) {
     g_metal_layer = SDL_Metal_GetLayer(view);
     SDL_Metal_GetDrawableSize(g_window, &g_window_w, &g_window_h);
     /* fullscreen: relative mouse mode keeps the (hidden) system cursor from stopping at the edges */
-    if (getenv("RC_FULLSCREEN")) SDL_SetRelativeMouseMode(SDL_TRUE);
+    if (fullscreen) SDL_SetRelativeMouseMode(SDL_TRUE);
     fprintf(stderr, "window: %dx%d drawable\n", g_window_w, g_window_h);
     for (int i = 0; i < SDL_NumJoysticks(); i++) pad_added(i);   /* already connected (also re-sent as events) */
     return 1;

@@ -9,6 +9,8 @@
  *        RC_LOG_FPS=1      frames per second
  *        RC_HEADLESS=1     no window (rendering skipped, Present paced at 60 Hz)
  *        RC_NO_AUDIO=1     mute
+ *        RC_OFFSCREEN=1    render on the GPU without a window (screenshots, automated tests)
+ *        RC_REFRESH_HZ=N   frame rate the game is paced to (default 60)
  */
 #include "win32.h"
 #include "render.h"
@@ -62,7 +64,8 @@ static void *game_main(void *arg) {
     PUSH32(c, GUEST_RETURN_SENTINEL);
     entry(c);
     fprintf(stderr, "game returned %d\n", (int)c->eax);
-    exit((int)c->eax);
+    extern void host_exit(int code);
+    host_exit((int)c->eax);
 }
 
 #if defined(__EMSCRIPTEN__) && !defined(RC_NODE_BUILD)
@@ -110,14 +113,21 @@ int main(int argc, char **argv) {
     if (!headless) g_render = &g_render_gpu;
     headless = 1;
 #else
-    if (!headless && window_create(PROFILE_TITLE)) g_render = &g_render_gpu;
+    if (getenv("RC_OFFSCREEN")) {   /* GPU rendering, no window, at remaster.cfg's `window = WxH` (pixels) if given */
+        extern const char *settings_window(void);
+        extern int g_window_w, g_window_h;
+        int w, h;
+        if (sscanf(settings_window(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) { g_window_w = w; g_window_h = h; }
+        g_render = &g_render_gpu; headless = 1;
+    }
+    else if (!headless && window_create(PROFILE_TITLE)) g_render = &g_render_gpu;
     else headless = 1;
 #endif
 
-    /* Recompiled code nests one host frame per guest call, so give the game a generous host stack. */
+    /* Recompiled code nests one host frame per guest call, so give the game a generous host stack (win32.h). */
     pthread_attr_t at;
     pthread_attr_init(&at);
-    pthread_attr_setstacksize(&at, 256u << 20);
+    pthread_attr_setstacksize(&at, HOST_STACK_GAME);
     pthread_t th;
     pthread_create(&th, &at, game_main, NULL);
     if (getenv("RC_WATCHDOG")) {

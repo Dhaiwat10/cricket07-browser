@@ -1,0 +1,37 @@
+{
+  "comment": "Cricket 07's byte patches, applied by the translator before decoding (build.sh picks this file with PROFILE=profiles/cricket07.h). Each entry checks the original bytes (or, for longer ones, their SHA-256), so a patch never lands on a different executable. entry_hooks: host functions the translated code calls on entry to a game function.",
+  "patches": [
+    {
+      "addr": "0x6e5613",
+      "new": "01",
+      "why": "Display Options > Apply: the menu passes the anti-aliasing list position (0 Off, 1 2x, 2 4x, 3 8x) but FUN_006e53d0 compares it with 2/4/8, so 2x applied nothing and 4x gave 2x. Compare with 1/2/3 instead (cmp dword ptr [ebp-0x3c], imm8).",
+      "old": "02"
+    },
+    {
+      "addr": "0x6e5619",
+      "new": "02",
+      "why": "see 0x6e5613",
+      "old": "04"
+    },
+    {
+      "addr": "0x6e561f",
+      "new": "03",
+      "why": "see 0x6e5613",
+      "old": "08"
+    },
+    {
+      "addr": "0x76a520",
+      "new": "51538b5c240c85db55740f8b2b817d005354524d896c240874065d31c05b59c3565783c50455e81578eeff8b430885c075068944241ceb5e8b430c8b700481e6ffffff008944241c8970048b7b0829f7897b0885ff7e3f8b53048d0c068b410489c6c1e21881e6000000ff39d674248339ff75098b4c24148b493ceb0725ffffff0001c18b410489c681e6000000ff39d675dc894b0ce8b577eeff83c4048b4424185f5e5d5b59c3cccccccccccccccc",
+      "why": "Data race in the stream buffer's 'take next block' (0x76a520, used by the movie player and audio streams): it read the stream's queued byte count and current block without the stream lock, while the reader thread (0x769ddf) bumps the count and only then sets the block, under that lock. Seeing the new count with the old null block, it walked the ring from address 0, where a zero-sized header loops forever: the intro movie froze on a black screen (about half the boots on iPhone, rarely natively). This rewrite does the same work with the lock (ctx+4, via 0x651d60/0x651d70) held from the first read until the next block is stored. Source: profiles/cricket07.strm_next.s.",
+      "old_sha256": "925c1285c4f92ee1039da58a498230bb38398001b923acc343d975a59183a984",
+      "old_len": 176
+    }
+  ],
+  "entry_hooks": [
+    {
+      "addr": "0x652a00",
+      "call": "hook_copy_source",
+      "why": "EA's memcpy (the plain-integer variant 0x64e3f0 picks without MMX/SSE). The game maps its .big archives (data.gob, 325 MB) with MapViewOfFile and reads every file out of them through this copy, so host/core.c fills a view's pages from the file only when a copy reads them (lazy views) instead of reading whole archives into memory, which phones can't spare."
+    }
+  ]
+}

@@ -9,3 +9,5 @@ int web_gpu_ready(void) { return 1; }
 int g_gpu_bc;
 size_t g_gpu_tex_bytes;
 uint32_t g_gpu_bind_groups_made;
+uint32_t g_gpu_pipelines_made;
+float render_aspect(void) { return 4.f / 3.f; }

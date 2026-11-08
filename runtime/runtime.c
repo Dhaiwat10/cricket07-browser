@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 uint8_t *g_mem;
 
@@ -358,8 +359,14 @@ int load_image(const char *path, LoadedImage *out) {
 void runtime_init(CPU *c) {
     /* +64 KiB so multi-byte accesses straddling 0xFFFFFFFF stay inside the mapping */
 #ifdef __EMSCRIPTEN__
-    g_mem = calloc(1, (size_t)GUEST_SPACE + 0x10000);
+    /* Not calloc: Emscripten's malloc has no mmap, so calloc memsets, which makes all 1.25 GB resident
+       at once and iOS Safari kills the tab. Memory above the current break is fresh WebAssembly memory
+       (already zero, and the break never moves down), so only what lies below it needs clearing. */
+    size_t size = (size_t)GUEST_SPACE + 0x10000;
+    uintptr_t brk0 = (uintptr_t)sbrk(0);
+    g_mem = malloc(size);
     if (!g_mem) { fprintf(stderr, "cannot allocate guest memory\n"); exit(1); }
+    if ((uintptr_t)g_mem < brk0) memset(g_mem, 0, brk0 - (uintptr_t)g_mem < size ? brk0 - (uintptr_t)g_mem : size);
 #else
     g_mem = mmap(NULL, GUEST_SPACE + 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (g_mem == MAP_FAILED) { perror("mmap 4GiB guest space"); exit(1); }
@@ -374,6 +381,11 @@ void runtime_init(CPU *c) {
     W32(GUEST_TIB + 0x18, GUEST_TIB);       /* self pointer */
     W32(GUEST_TIB + 0x04, GUEST_STACK_TOP); /* stack base */
     W32(GUEST_TIB + 0x08, GUEST_STACK_TOP - GUEST_STACK_SIZE);
+}
+
+void (*g_copy_source_hook)(uint32_t src, uint32_t len);
+void hook_copy_source(CPU *c) {   /* memcpy(dst, src, n): the return address is at esp */
+    if (g_copy_source_hook) g_copy_source_hook(R32(c->esp + 8), R32(c->esp + 12));
 }
 
 uint32_t g_heap_next = GUEST_HEAP_BASE;

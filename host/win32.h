@@ -46,6 +46,22 @@ void heap_free(uint32_t a);
 uint32_t heap_realloc(uint32_t a, uint32_t size, int zero);
 uint32_t heap_size(uint32_t a);
 uint32_t guest_valloc(uint32_t size);              /* page-granular, zero-filled */
+uint32_t guest_vfree(uint32_t a);                  /* releases a guest_valloc region; its size, or 0 */
+/* Host stacks for threads that run recompiled code. Natively that is the machine stack, where every guest call
+   nests a frame. In wasm the engine keeps those frames on its own stack, and this is only the shadow stack in
+   linear memory (locals whose address is taken): a match uses about 6 KB of it, so a few MB leave ample room
+   and spare the browser hundreds of MB of memory. To check, build with EXTRA_LINK=-sSTACK_OVERFLOW_CHECK=2
+   (traps on overflow) and run a match under Node. */
+#ifdef __EMSCRIPTEN__
+#define HOST_STACK_GAME   (8u << 20)
+#define HOST_STACK_THREAD (4u << 20)
+#else
+#define HOST_STACK_GAME   (256u << 20)
+#define HOST_STACK_THREAD (64u << 20)
+#endif
+uint32_t guest_view_map(int fd, uint32_t len, uint32_t eager);   /* lazy file view (core.c); 0 if none */
+int guest_view_unmap(uint32_t a);                  /* before guest_vfree of a lazy view */
+uint32_t guest_view_end(uint32_t a);               /* end of the lazy view holding a, or 0 */
 uint32_t guest_strdup(const char *s);
 
 /* ------------------------------------------------------------------ handles */
@@ -93,12 +109,14 @@ extern uint8_t g_keys[256];
 
 uint64_t host_time_100ns(void);  /* FILETIME units since 1601 */
 double host_seconds(void);       /* monotonic */
+void host_realtime(struct timespec *ts);   /* wall clock (CLOCK_REALTIME) for condition-wait deadlines */
 /* Time the game sees (core.c). Normally host_seconds(); with RC_DETERMINISTIC=1 a virtual clock that only
    the game's main thread advances (per Present, per Sleep, 1 us per time read), so it is a function of
    that thread's execution rather than of wall time. */
 double guest_seconds(void);
 uint64_t guest_time_100ns(void); /* FILETIME units since 1601 */
 int deterministic(void);
+int refresh_hz(void);           /* RC_REFRESH_HZ: display refresh the game is paced to (default 60) */
 void vclock_frame(void);         /* Present */
 void vclock_init(void);          /* main(), before the game starts */
 double guest_peek_seconds(void); /* guest_seconds() without advancing the virtual clock */

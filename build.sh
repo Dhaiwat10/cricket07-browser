@@ -4,7 +4,7 @@
 # -> build/librecomp.dylib (the recompiled code, for tests/difftest.py) and build/recomp (the launcher).
 # Only generated files whose content changed are recompiled. TRACE=1 builds build/librecomp_trace.dylib
 # instead (every instruction calls trace_insn). PROFILE=path/to/profile.h picks the game profile
-# (default host/profile.h). PY, WGPU and SDL2 override the Python, wgpu-native and SDL2 locations.
+# (default host/profile.h) and, with it, profiles/<game>.patches.json if there is one (or PATCHES=file). PY, WGPU and SDL2 override the Python, wgpu-native and SDL2 locations.
 set -e
 R=$(cd "$(dirname "$0")" && pwd)
 EXE=${1:?usage: build.sh <game.exe> <functions.json>}
@@ -19,7 +19,10 @@ if [ "${TRACE:-0}" = 1 ]; then OUT=out_trace; OBJ=obj_trace; LIB=librecomp_trace
 else OUT=out_all; OBJ=obj_all; LIB=librecomp.dylib; TFLAG=; fi
 export OUT OBJ  # used inside the per-file compile command below
 
-"$PY" -I "$R/translator/x86toc.py" "$EXE" "$FUNCS" "$R/$OUT" --all --per-file 300 $TFLAG | head -1
+# the profile's byte patches and entry hooks (profiles/<game>.patches.json next to profiles/<game>.h), or PATCHES=
+PATCHES=${PATCHES:-${PROFILE%.h}.patches.json}
+PATCHFLAG=; [ -n "$PROFILE" ] && [ -f "$PATCHES" ] && PATCHFLAG="--patches $PATCHES" && echo "patches: $PATCHES"
+"$PY" -I "$R/translator/x86toc.py" "$EXE" "$FUNCS" "$R/$OUT" --all --per-file 300 $TFLAG $PATCHFLAG | head -1
 mkdir -p "$R/build/$OBJ"
 cd "$R"
 ls $OUT/*.c | while read f; do

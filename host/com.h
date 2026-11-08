@@ -34,11 +34,13 @@ typedef struct ComObj {
 uint32_t com_new(ComInterface *it, int type, void *data);  /* returns the guest object pointer */
 ComObj *com_get(uint32_t guest);                           /* NULL if not one of ours */
 void *com_data(uint32_t guest);
+int com_live_count(void);                                   /* live objects, out of 65536 slots */
 
 /* Standard IUnknown handlers usable in any interface's table. */
 void com_QueryInterface(CPU *c);
 void com_AddRef(CPU *c);
 void com_Release(CPU *c);
+uint32_t com_release(uint32_t guest);   /* host-side Release: drops one reference, frees at zero */
 
 extern int g_log_d3d;  /* RC_LOG_D3D: 1 = object creation and unusual calls, 2 = every call */
 

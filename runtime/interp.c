@@ -26,7 +26,7 @@ void dyncode_register(uint32_t addr, uint32_t len) {
 }
 
 int dyncode_contains(uint32_t addr) {
-    if (addr >= g_image_lo && addr < g_image_hi) return 0;  /* never the image itself */
+    if (addr < g_image_hi) return 0;  /* never the image itself (or below it) */
     int n = __atomic_load_n(&g_nregions, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++)
         if (addr >= g_regions[i].lo && addr < g_regions[i].hi) return 1;

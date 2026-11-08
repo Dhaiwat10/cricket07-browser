@@ -7,6 +7,7 @@
 #include "vshader.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdlib.h>
 
 enum { RT_TEMP = 0, RT_INPUT = 1, RT_CONST = 2, RT_ADDR = 3, RT_RASTOUT = 4, RT_ATTROUT = 5, RT_TEXOUT = 6 };
@@ -281,4 +282,222 @@ void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t
     memcpy(out->d0, o_d[0], 16);
     memcpy(out->d1, o_d[1], 16);
     for (int t = 0; t < 4; t++) memcpy(out->tex[t], o_t[t], 16);
+}
+
+/* ------------------------------------------------------------------ GPU translation
+ *
+ * The same decoded program, translated to a WGSL vertex function (`vs_gpu`) so the GPU runs it instead
+ * of vs_run(). Inputs come straight from the game's vertex streams (vertex attributes at location =
+ * input register), constants from a uniform array (`vc`, declaration/def constants merged in by the
+ * caller, see vs_merge_defs), and the outputs feed the same VO struct as the fixed-function vertex stage.
+ * Semantics follow vs_run() so both paths draw the same picture. */
+
+int vs_gpu_inputs(Shader *sh, VsGpuInput in[16]) {
+    VsProgram *p = program_for(sh);
+    if (!p->ok) return -1;
+    int n = 0;
+    for (int r = 0; r < 16; r++) {
+        if (!p->in[r].used) continue;
+        if (p->fixed_function && r != 0 && r != 5 && r != 6 && (r < 7 || r > 10)) continue;   /* unread */
+        in[n].reg = (uint8_t)r; in[n].stream = p->in[r].stream; in[n].type = p->in[r].type; in[n].offset = p->in[r].offset;
+        n++;
+    }
+    return n;
+}
+
+void vs_merge_defs(Shader *sh, float c[96][4]) {
+    VsProgram *p = program_for(sh);
+    for (int i = 0; i < 96; i++) if (p->has_def[i]) memcpy(c[i], p->defs[i], 16);
+}
+
+typedef struct { char *s; size_t n, cap; } Buf;
+static void bput(Buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void bput(Buf *b, const char *fmt, ...) {
+    va_list ap;
+    for (;;) {
+        va_start(ap, fmt);
+        int k = vsnprintf(b->s ? b->s + b->n : NULL, b->s ? b->cap - b->n : 0, fmt, ap);
+        va_end(ap);
+        if (k < 0) return;
+        if (b->s && b->n + (size_t)k < b->cap) { b->n += (size_t)k; return; }
+        b->cap = (b->cap + (size_t)k + 1) * 2;
+        b->s = realloc(b->s, b->cap);
+        if (b->n == 0) b->s[0] = 0;
+    }
+}
+
+/* a source operand as a WGSL vec4 expression; `add` offsets the register number (matrix rows) */
+static void src_expr(Buf *b, const Src *s, int add, const uint8_t used_in[16]) {
+    char base[48];
+    int num = s->num + add;
+    switch (s->type) {
+    case RT_TEMP: if (num < 12) snprintf(base, sizeof base, "r%d", num); else snprintf(base, sizeof base, "vec4<f32>(0.0)"); break;
+    case RT_INPUT:
+        if (num < 16 && used_in[num]) snprintf(base, sizeof base, "v%d", num);
+        else snprintf(base, sizeof base, "vec4<f32>(0.0, 0.0, 0.0, 1.0)");
+        break;
+    case RT_CONST:
+        if (s->rel) snprintf(base, sizeof base, "vc_at(a0 + %d)", num);
+        else if (num < 96) snprintf(base, sizeof base, "vc[%d]", num);
+        else snprintf(base, sizeof base, "vec4<f32>(0.0)");
+        break;
+    default: snprintf(base, sizeof base, "vec4<f32>(0.0)"); break;
+    }
+    static const char comp[4] = { 'x', 'y', 'z', 'w' };
+    int ident = s->swz[0] == 0 && s->swz[1] == 1 && s->swz[2] == 2 && s->swz[3] == 3;
+    bput(b, "%s%s", s->neg ? "(-" : "", base);
+    if (!ident) bput(b, ".%c%c%c%c", comp[s->swz[0]], comp[s->swz[1]], comp[s->swz[2]], comp[s->swz[3]]);
+    if (s->neg) bput(b, ")");
+}
+
+static const char *VS_WGSL_HELPERS =
+"@group(0) @binding(1) var<uniform> vc: array<vec4<f32>, 96>;\n"
+"fn vc_at(i: i32) -> vec4<f32> { if (i < 0 || i >= 96) { return vec4<f32>(0.0); } return vc[i]; }\n"
+"fn d3d_rcp(x: f32) -> f32 { if (x == 1.0) { return 1.0; } return 1.0 / x; }\n"
+"fn d3d_rsq(x0: f32) -> f32 { let x = abs(x0); if (x == 1.0) { return 1.0; } return inverseSqrt(x); }\n"
+"fn d3d_log(x0: f32) -> f32 { return log2(abs(x0)); }\n"
+"fn d3d_lit(s: vec4<f32>) -> vec4<f32> {\n"
+"  let pw = clamp(s.w, -128.0, 128.0);\n"
+"  var r = vec4<f32>(1.0, max(s.x, 0.0), 0.0, 1.0);\n"
+"  if (s.x > 0.0 && s.y > 0.0) { r.z = pow(s.y, pw); }\n"
+"  return r;\n"
+"}\n"
+"fn d3d_expp(w: f32) -> vec4<f32> { let f = floor(w); return vec4<f32>(exp2(f), w - f, exp2(w), 1.0); }\n"
+"fn d3d_logp(w: f32) -> vec4<f32> {\n"
+"  let x = abs(w);\n"
+"  let e = floor(log2(x));\n"
+"  return vec4<f32>(e, x / exp2(e), log2(x), 1.0);\n"
+"}\n";
+
+/* WGSL type and vec4 conversion per declaration type */
+static const char *in_type(uint32_t t) {
+    static const char *ty[8] = { "f32", "vec2<f32>", "vec3<f32>", "vec4<f32>", "vec4<f32>", "vec4<u32>", "vec2<i32>", "vec4<i32>" };
+    return t < 8 ? ty[t] : NULL;
+}
+static void in_convert(Buf *b, int r, uint32_t t) {
+    switch (t) {
+    case 0: bput(b, "  var v%d = vec4<f32>(i.a%d, 0.0, 0.0, 1.0);\n", r, r); break;
+    case 1: bput(b, "  var v%d = vec4<f32>(i.a%d, 0.0, 1.0);\n", r, r); break;
+    case 2: bput(b, "  var v%d = vec4<f32>(i.a%d, 1.0);\n", r, r); break;
+    case 3: bput(b, "  var v%d = i.a%d;\n", r, r); break;
+    case 4: bput(b, "  var v%d = i.a%d.zyxw;\n", r, r); break;   /* D3DCOLOR bytes are B, G, R, A */
+    case 5: bput(b, "  var v%d = vec4<f32>(i.a%d);\n", r, r); break;
+    case 6: bput(b, "  var v%d = vec4<f32>(vec2<f32>(i.a%d), 0.0, 1.0);\n", r, r); break;
+    case 7: bput(b, "  var v%d = vec4<f32>(i.a%d);\n", r, r); break;
+    }
+}
+
+char *vs_to_wgsl(Shader *sh, char *why, size_t why_n) {
+    VsProgram *p = program_for(sh);
+    if (!p->ok) { snprintf(why, why_n, "not decoded"); return NULL; }
+    VsGpuInput ins[16];
+    int nin = vs_gpu_inputs(sh, ins);
+    uint8_t used_in[16] = { 0 };
+    Buf b = { 0 };
+    bput(&b, "%s", VS_WGSL_HELPERS);
+    bput(&b, "struct VG {\n");
+    for (int k = 0; k < nin; k++) {
+        const char *ty = in_type(ins[k].type);
+        if (!ty) { snprintf(why, why_n, "input type %u", ins[k].type); free(b.s); return NULL; }
+        bput(&b, "  @location(%u) a%u: %s,\n", ins[k].reg, ins[k].reg, ty);
+        used_in[ins[k].reg] = 1;
+    }
+    if (!nin) bput(&b, "  @builtin(vertex_index) vid: u32,\n");   /* WGSL structs can't be empty */
+    bput(&b, "};\n@vertex fn vs_gpu(i: VG) -> VO {\n");
+    for (int k = 0; k < nin; k++) in_convert(&b, ins[k].reg, ins[k].type);
+    bput(&b, "  var oPos = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n  var oD0 = vec4<f32>(1.0);\n  var oD1 = vec4<f32>(0.0);\n");
+    for (int t = 0; t < 4; t++) bput(&b, "  var oT%d = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n", t);
+
+    if (p->fixed_function) {
+        /* declaration-only shader: v0 position (through world*view*projection), v5/v6 colors, v7+ texcoords */
+        bput(&b, "  oPos = u.mvp * vec4<f32>(%s.xyz, 1.0);\n", used_in[0] ? "v0" : "vec4<f32>(0.0)");
+        if (used_in[5]) bput(&b, "  oD0 = v5;\n");
+        if (used_in[6]) bput(&b, "  oD1 = v6;\n");
+        for (int t = 0; t < 4; t++) if (used_in[7 + t]) bput(&b, "  oT%d = v%d;\n", t, 7 + t);
+    } else {
+        for (int r = 0; r < 12; r++) bput(&b, "  var r%d = vec4<f32>(0.0);\n", r);
+        bput(&b, "  var a0: i32 = 0;\n  var t: vec4<f32>;\n");
+        for (uint32_t n = 0; n < p->n; n++) {
+            const Insn *in = &p->code[n];
+            Buf e = { 0 }, s0 = { 0 }, s1 = { 0 }, s2 = { 0 };
+            if (in->nsrc > 0) src_expr(&s0, &in->s[0], 0, used_in);
+            if (in->nsrc > 1) src_expr(&s1, &in->s[1], 0, used_in);
+            if (in->nsrc > 2) src_expr(&s2, &in->s[2], 0, used_in);
+            const char *a = s0.s ? s0.s : "", *c1 = s1.s ? s1.s : "", *c2 = s2.s ? s2.s : "";
+            int ok = 1;
+            switch (in->op) {
+            case 1: bput(&e, "%s", a); break;
+            case 2: bput(&e, "%s + %s", a, c1); break;
+            case 3: bput(&e, "%s - %s", a, c1); break;
+            case 4: bput(&e, "%s * %s + %s", a, c1, c2); break;
+            case 5: bput(&e, "%s * %s", a, c1); break;
+            case 6: bput(&e, "vec4<f32>(d3d_rcp((%s).w))", a); break;
+            case 7: bput(&e, "vec4<f32>(d3d_rsq((%s).w))", a); break;
+            case 8: bput(&e, "vec4<f32>(dot((%s).xyz, (%s).xyz))", a, c1); break;
+            case 9: bput(&e, "vec4<f32>(dot(%s, %s))", a, c1); break;
+            case 10: bput(&e, "select(%s, %s, %s < %s)", c1, a, a, c1); break;    /* min: s0 < s1 ? s0 : s1 */
+            case 11: bput(&e, "select(%s, %s, %s >= %s)", c1, a, a, c1); break;   /* max: s0 >= s1 ? s0 : s1 */
+            case 12: bput(&e, "select(vec4<f32>(0.0), vec4<f32>(1.0), %s < %s)", a, c1); break;
+            case 13: bput(&e, "select(vec4<f32>(0.0), vec4<f32>(1.0), %s >= %s)", a, c1); break;
+            case 14: bput(&e, "vec4<f32>(exp2((%s).w))", a); break;
+            case 15: bput(&e, "vec4<f32>(d3d_log((%s).w))", a); break;
+            case 16: bput(&e, "d3d_lit(%s)", a); break;
+            case 17: bput(&e, "vec4<f32>(1.0, (%s).y * (%s).y, (%s).z, (%s).w)", a, c1, a, c1); break;
+            case 18: bput(&e, "%s * (%s - %s) + %s", a, c1, c2, c2); break;
+            case 19: bput(&e, "fract(%s)", a); break;
+            case 20: case 21: case 22: case 23: case 24: {
+                int rows = in->op == 20 || in->op == 22 ? 4 : in->op == 24 ? 2 : 3, four = in->op <= 21;
+                bput(&e, "vec4<f32>(");
+                for (int k = 0; k < 4; k++) {
+                    if (k) bput(&e, ", ");
+                    if (k >= rows) { bput(&e, "0.0"); continue; }
+                    Buf row = { 0 };
+                    src_expr(&row, &in->s[1], k, used_in);
+                    if (four) bput(&e, "dot(%s, %s)", a, row.s);
+                    else bput(&e, "dot((%s).xyz, (%s).xyz)", a, row.s);
+                    free(row.s);
+                }
+                bput(&e, ")");
+                break;
+            }
+            case 78: bput(&e, "d3d_expp((%s).w)", a); break;
+            case 79: bput(&e, "d3d_logp((%s).w)", a); break;
+            default: ok = 0; break;
+            }
+            free(s0.s); free(s1.s); free(s2.s);
+            if (!ok) { snprintf(why, why_n, "opcode %u", in->op); free(e.s); free(b.s); return NULL; }
+            /* destination */
+            char dst[16] = "";
+            switch (in->dtype) {
+            case RT_TEMP: if (in->dnum < 12) snprintf(dst, sizeof dst, "r%u", in->dnum); break;
+            case RT_ADDR: break;
+            case RT_RASTOUT: if (in->dnum == 0) snprintf(dst, sizeof dst, "oPos"); break;
+            case RT_ATTROUT: if (in->dnum < 2) snprintf(dst, sizeof dst, "oD%u", in->dnum); break;
+            case RT_TEXOUT: if (in->dnum < 4) snprintf(dst, sizeof dst, "oT%u", in->dnum); break;
+            default: break;
+            }
+            if (in->dtype == RT_ADDR) {
+                if (in->dmask & 1) bput(&b, "  t = %s;\n  a0 = i32(floor(t.x));\n", e.s);
+            } else if (dst[0] && in->dmask) {
+                bput(&b, "  t = %s;\n", e.s);
+                if (in->dmask == 0xF) bput(&b, "  %s = t;\n", dst);
+                else for (int k = 0; k < 4; k++) if (in->dmask & (1 << k)) bput(&b, "  %s.%c = t.%c;\n", dst, "xyzw"[k], "xyzw"[k]);
+            }
+            free(e.s);
+        }
+    }
+    /* Direct3D's half-pixel offset, as in the fixed-function vertex stage; colors clamp like vs_run()'s */
+    bput(&b,
+         "  var o: VO;\n"
+         "  var q = oPos;\n"
+         "  q.x = q.x + q.w / u.vp.z;\n"
+         "  q.y = q.y - q.w / u.vp.w;\n"
+         "  o.pos = q;\n"
+         "  if (u.misc.z != 0.0) { o.pos.x = o.pos.x * u.misc.z + o.pos.w * u.misc.w; }\n"
+         "  o.diffuse = saturate(oD0);\n"
+         "  o.specular = saturate(oD1);\n"
+         "  o.tc0 = oT0; o.tc1 = oT1; o.tc2 = oT2; o.tc3 = oT3;\n"
+         "  return o;\n"
+         "}\n");
+    return b.s;
 }

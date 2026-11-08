@@ -39,19 +39,29 @@ HOST_NODE="$(ls "$B"/host/*.o | grep -v '/main.o$' | grep -v '/render_wgpu.o$') 
 # Browser build: page thread renders (WebGPU), game files from OPFS, modular loader for loader.js
 emcc -pthread ${LINKOPT:-$OPT} --profiling-funcs -o "$B/www/recomp.js" "$B"/runtime.o "$B"/interp.o $HOST_WEB "$B"/obj/*.o \
     --use-port=emdawnwebgpu -sWASMFS -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH \
-    -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=32MB -sENVIRONMENT=web,worker \
+    -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB -sENVIRONMENT=web,worker \
     -sMODULARIZE -sEXPORT_NAME=createRecomp -sEXPORTED_RUNTIME_METHODS=ENV,wasmMemory -sEXIT_RUNTIME=0 $EXTRA_LINK
 # Firefox rejects any typed array over 2 GB as setBindGroup's dynamic offsets, and the bindings pass a view of
-# the whole wasm memory (with start/length): hand it a copy of just the offsets instead.
-# (matches both the -O1 and the minified -O2 output)
-perl -0pi -e 's/\(growMemViews\(\),\s*HEAPU32\),\s*\(*dynamicOffsetsPtr\)?\s*>>>\s*2\)?,\s*dynamicOffsetCount\)/(growMemViews(),HEAPU32.slice(dynamicOffsetsPtr>>>2,(dynamicOffsetsPtr>>>2)+dynamicOffsetCount)))/g' "$B/www/recomp.js"
+# the whole wasm memory (with start/length): hand it a copy of just the offsets instead. -O2 links strip the
+# spaces and parentheses, so the pattern allows both forms.
+perl -0pi -e 's/\(growMemViews\(\),\s*HEAPU32\),\s*\(?\(?dynamicOffsetsPtr\)?\s*>>>\s*2\)?,\s*dynamicOffsetCount\)/(growMemViews(), HEAPU32.slice(dynamicOffsetsPtr >>> 2, (dynamicOffsetsPtr >>> 2) + dynamicOffsetCount)))/g' "$B/www/recomp.js"
 grep -q 'HEAPU32.slice(dynamicOffsetsPtr' "$B/www/recomp.js" || echo "warning: setBindGroup offsets patch did not apply (emdawnwebgpu changed?)" >&2
+# ...but that copy is a new ArrayBuffer per draw (~12,000 a second in a match), and Safari's page-thread
+# collector can stall for minutes after a download (see README, "Memory in WebKit"), so the copies pile up at
+# megabytes a second. Hand setBindGroup the offsets in one small array that lives for the page instead.
+perl -0pi -e 's/\(growMemViews\(\), HEAPU32\.slice\(dynamicOffsetsPtr >>> 2, \(dynamicOffsetsPtr >>> 2\) \+ dynamicOffsetCount\)\)\)/rcDynOff(dynamicOffsetsPtr,dynamicOffsetCount),0,dynamicOffsetCount)/g; s/function _wgpuRenderPassEncoderSetBindGroup\(/var rcDynOffBuf=new Uint32Array(64);function rcDynOff(p,n){growMemViews();p>>>=2;if(n>64)return HEAPU32.slice(p,p+n);var b=rcDynOffBuf;for(var i=0;i<n;i++)b[i]=HEAPU32[p+i];return b}function _wgpuRenderPassEncoderSetBindGroup(/' "$B/www/recomp.js"
+grep -q 'rcDynOff(dynamicOffsetsPtr,dynamicOffsetCount),0,dynamicOffsetCount)' "$B/www/recomp.js" || echo "warning: setBindGroup scratch-offsets patch did not apply" >&2
+# libc's clock_gettime crosses into JS (clock_time_get) with a 64-bit result that the engine boxes as a BigInt
+# object per call; the host reads its clocks through emscripten_get_now instead (core.c), but libc's own timed
+# waits and sleeps still land here. Store the two 32-bit halves so the call allocates nothing in Safari.
+perl -0pi -e 's/var nsec=Math\.round\(now\*1e6\);\(growMemViews\(\),HEAP64\)\[ptime>>>3>>>0\]=BigInt\(nsec\);/var nsec=Math.round(now*1e6);var lo=nsec%4294967296;(growMemViews(),HEAPU32)[ptime>>>2>>>0]=lo;HEAPU32[(ptime>>>2)+1>>>0]=(nsec-lo)\/4294967296;/' "$B/www/recomp.js"
+grep -q 'HEAPU32)\[ptime>>>2>>>0\]=lo' "$B/www/recomp.js" || echo "warning: clock_time_get patch did not apply (Emscripten changed?)" >&2
 echo "built build_web/www/recomp.js"
 
 # Node build: headless, real file system, RC_* environment passed through
 emcc -pthread ${LINKOPT:-$OPT} --profiling-funcs -o "$B/node/recomp.js" "$B"/runtime.o "$B"/interp.o "$B"/main_node.o $HOST_NODE "$B"/obj/*.o \
     -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=12 -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=4GB \
-    -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=32MB -sENVIRONMENT=node -sNODERAWFS=1 -sEXIT_RUNTIME=1 \
+    -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB -sENVIRONMENT=node -sNODERAWFS=1 -sEXIT_RUNTIME=1 \
     --pre-js web/node_env.js $EXTRA_LINK
 # Node gives each worker a 4 MB engine stack; recompiled code nests one engine frame per guest call
 perl -0pi -e 's/("?name"?:\s*"em-pthread")/$1, resourceLimits: { stackSizeMb: 256 }/' "$B/node/recomp.js"

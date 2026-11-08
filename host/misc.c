@@ -204,7 +204,7 @@ W(timeSetEvent) {
         pthread_t pt;
         pthread_attr_t at;
         pthread_attr_init(&at);
-        pthread_attr_setstacksize(&at, 64u << 20);
+        pthread_attr_setstacksize(&at, HOST_STACK_THREAD);
         pthread_create(&pt, &at, timer_main, NULL);
         pthread_detach(pt);
     }

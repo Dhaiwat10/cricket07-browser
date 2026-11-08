@@ -1,5 +1,8 @@
 /* KERNEL32.DLL */
 #include "win32.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -121,11 +124,21 @@ W(GetCurrentThreadId) { RET(0, t_self ? t_self->id : 0x100); }
 W(GetLastError) { RET(0, t_self ? t_self->last_error : 0); }
 W(SetLastError) { set_error(ARG(0)); RET(1, 0); }
 
+/* The game ended: Quit in its main menu, or a fatal error. In the browser exit() only stops the game's thread
+   and leaves its last frame on the canvas, so the page is told first and goes back to its launcher
+   (web/loader.js: rcGameExit). */
+void host_exit(int code) {
+#ifdef __EMSCRIPTEN__
+    MAIN_THREAD_ASYNC_EM_ASM({ if (Module.rcGameExit) Module.rcGameExit($0); }, code);
+#endif
+    exit(code);
+}
+
 W(ExitProcess) {
     fprintf(stderr, "[kernel32] ExitProcess(%d) from thread %u, stack:", (int)ARG(0), t_self ? t_self->id : 0);
     for (int k = 0, n = 0; k < 4096 && n < 32; k++) {
         uint32_t v = R32(c->esp + 4 * k);
-        if (v >= 0x401000 && v < 0x7a0000) { fprintf(stderr, " %08x", v); n++; }
+        if (v >= g_image_lo && v < g_image_hi) { fprintf(stderr, " %08x", v); n++; }
     }
     fprintf(stderr, "\n");
     /* strings still on the stack (the fatal error's message and arguments) */
@@ -137,15 +150,15 @@ W(ExitProcess) {
         while (len < 120 && p[len] >= 0x20 && p[len] < 0x7f) len++;
         if (len >= 6 && (p[len] == 0 || p[len] == '\n')) { fprintf(stderr, "    \"%.*s\"\n", len, (const char *)p); n++; }
     }
-    exit((int)ARG(0));
+    host_exit((int)ARG(0));
 }
 W(TerminateProcess) {
     fprintf(stderr, "[kernel32] TerminateProcess(%d)\n", (int)ARG(1));
-    exit((int)ARG(1));
+    host_exit((int)ARG(1));
 }
 W(FatalAppExitA) {
     fprintf(stderr, "[kernel32] FatalAppExit: %s\n", GSTR(ARG(1)));
-    exit(3);
+    host_exit(3);
 }
 
 W(GetSystemInfo) {
@@ -340,7 +353,20 @@ W(GetTickCount) { RET(0, (uint32_t)(guest_seconds() * 1000.0)); }
 W(QueryPerformanceFrequency) { W64(ARG(0), 1000000000ull); RET(1, 1); }
 W(QueryPerformanceCounter) { W64(ARG(0), (uint64_t)(guest_seconds() * 1e9)); RET(1, 1); }
 W(GetSystemTimeAsFileTime) { W64(ARG(0), guest_time_100ns()); RET(1, 0); }
-W(FileTimeToLocalFileTime) { W64(ARG(1), R64(ARG(0))); RET(2, 1); }
+/* The host's offset from UTC in seconds (east positive). Online every peer must see the same clock, so
+   there the guest lives in UTC. No daylight-saving rules: the guest gets the current offset as a fixed one. */
+static long utc_offset(void) {
+    if (deterministic()) return 0;
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    return lt.tm_gmtoff;
+}
+W(FileTimeToLocalFileTime) {
+    int64_t ft = (int64_t)R64(ARG(0)) + (int64_t)utc_offset() * 10000000;
+    W64(ARG(1), ft > 0 ? (uint64_t)ft : 0);
+    RET(2, 1);
+}
 W(FileTimeToSystemTime) {
     uint64_t ft = R64(ARG(0));
     time_t t = (time_t)(ft / 10000000ull - 11644473600ull);
@@ -352,7 +378,11 @@ W(FileTimeToSystemTime) {
     W16(p + 12, (uint16_t)tmv.tm_sec); W16(p + 14, (uint16_t)((ft / 10000) % 1000));
     RET(2, 1);
 }
-W(GetTimeZoneInformation) { memset(HP(ARG(0)), 0, 172); RET(1, 0 /* TIME_ZONE_ID_UNKNOWN */); }
+W(GetTimeZoneInformation) {
+    memset(HP(ARG(0)), 0, 172);
+    W32(ARG(0), (uint32_t)(int32_t)(-utc_offset() / 60));  /* Bias: UTC = local + bias (minutes) */
+    RET(1, 0 /* TIME_ZONE_ID_UNKNOWN: no daylight-saving dates */);
+}
 W(GetDateFormatA) {
     const char *s = "15/10/2026";
     if (ARG(5)) snprintf((char *)HP(ARG(4)), ARG(5), "%s", s);
@@ -383,12 +413,18 @@ W(LocalFree) { heap_free(ARG(0)); RET(1, 0); }
 
 W(VirtualAlloc) {
     uint32_t addr = ARG(0), size = ARG(1);
+    LOG("[kernel32] VirtualAlloc(%08x, %x, %x)\n", addr, size, ARG(2));
     if (addr) RET(4, addr);  /* committing inside a region we already handed out */
     RET(4, guest_valloc(size));
 }
-W(VirtualFree) { RET(3, 1); }
+W(VirtualFree) {
+    /* MEM_RELEASE (0x8000) of a region's base frees it; MEM_DECOMMIT keeps the address space */
+    uint32_t freed = (ARG(2) & 0x8000) ? guest_vfree(ARG(0)) : 0;
+    LOG("[kernel32] VirtualFree(%08x, %x, %x) released %u bytes\n", ARG(0), ARG(1), ARG(2), freed);
+    RET(3, 1);
+}
 W(VirtualProtect) {
-    /* Executable protections mark code the game generated or loaded itself (e.g. sound-engine plug-ins). */
+    /* Executable protections mark code the game generated or loaded itself (AEMS sound modules). */
     if (ARG(2) & 0xf0) { LOG("[kernel32] VirtualProtect(%08x, %x, exec)\n", ARG(0), ARG(1)); dyncode_register(ARG(0), ARG(1)); }
     if (ARG(3)) W32(ARG(3), 4 /* PAGE_READWRITE */);
     RET(4, 1);
@@ -604,7 +640,7 @@ static uint32_t wait_one(uint32_t h, uint32_t ms) {
     if (sched_active()) return wait_one_det(x, ms);
     Sync *s = x->ptr;
     struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
+    host_realtime(&dl);   /* not clock_gettime: in wasm that allocates (core.c, host_time_100ns) */
     if (ms != 0xFFFFFFFFu) {
         dl.tv_sec += ms / 1000;
         dl.tv_nsec += (long)(ms % 1000) * 1000000L;
@@ -689,6 +725,8 @@ static void *thread_main(void *arg) {
     pthread_cond_broadcast(&ts->sync->cv);
     pthread_mutex_unlock(&ts->sync->m);
     LOG("[kernel32] thread %x exits with %u\n", ts->t->id, c->eax);
+    guest_vfree(R32(ts->t->tib + 0x08));   /* its guest stack and TIB: no guest code runs on them any more */
+    guest_vfree(ts->t->tib);
     sched_exit();
     return NULL;
 }
@@ -738,7 +776,7 @@ W(CreateThread) {
     pthread_t pt;
     pthread_attr_t at;
     pthread_attr_init(&at);
-    pthread_attr_setstacksize(&at, 64u << 20);  /* host stack: recompiled frames are large (more so in wasm) */
+    pthread_attr_setstacksize(&at, HOST_STACK_THREAD);
     pthread_create(&pt, &at, thread_main, ts);
     pthread_detach(pt);
     LOG("[kernel32] CreateThread(start=%08x param=%08x flags=%x) -> handle %x tid %x\n", start, param, flags, h, t->id);
@@ -873,28 +911,42 @@ W(SetEndOfFile) {
 W(DeleteFileA) {
     char host[1024];
     map_path(GSTR(ARG(0)), host, sizeof host);
-    RET(1, unlink(host) == 0);
+    int r = unlink(host);
+    LOG("[file] DeleteFileA(%s) = %s\n", host, r ? strerror(errno) : "ok");
+    RET(1, r == 0);
 }
 W(MoveFileA) {
     char a[1024], b[1024];
     map_path(GSTR(ARG(0)), a, sizeof a);
     map_path(GSTR(ARG(1)), b, sizeof b);
-    RET(2, rename(a, b) == 0);
+    int r = rename(a, b);
+    LOG("[file] MoveFileA(%s -> %s) = %s\n", a, b, r ? strerror(errno) : "ok");
+    RET(2, r == 0);
 }
 W(CreateDirectoryA) {
     char host[1024];
     map_path(GSTR(ARG(0)), host, sizeof host);
     int r = mkdir(host, 0755);
+    LOG("[file] CreateDirectoryA(%s) = %s\n", host, r ? strerror(errno) : "ok");
     if (r && errno == EEXIST) set_error(ERROR_ALREADY_EXISTS);
     RET(2, r == 0);
 }
 W(RemoveDirectoryA) {
     char host[1024];
     map_path(GSTR(ARG(0)), host, sizeof host);
-    RET(1, rmdir(host) == 0);
+    int r = rmdir(host);
+    LOG("[file] RemoveDirectoryA(%s) = %s\n", host, r ? strerror(errno) : "ok");
+    RET(1, r == 0);
 }
 
 typedef struct { char dir[1024]; char pattern[256]; DIR *d; } FindState;
+
+/* Host file times as FILETIME. Online (deterministic lockstep) every peer must see the same thing, and
+   the hosts' clocks differ, so there the times stay zero. */
+static uint64_t unix_to_filetime(time_t t) {
+    if (deterministic() || t <= 0) return 0;
+    return ((uint64_t)t + 11644473600ull) * 10000000ull;
+}
 
 static int find_next(FindState *fs, uint32_t out) {
     struct dirent *e;
@@ -906,6 +958,10 @@ static int find_next(FindState *fs, uint32_t out) {
         if (stat(full, &st)) continue;
         memset(HP(out), 0, 320);  /* WIN32_FIND_DATAA */
         W32(out, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+        /* creation, last access, last write: the load/save screens show the last write as the save's date */
+        W64(out + 4, unix_to_filetime(st.st_ctime));
+        W64(out + 12, unix_to_filetime(st.st_atime));
+        W64(out + 20, unix_to_filetime(st.st_mtime));
         W32(out + 28, (uint32_t)((uint64_t)st.st_size >> 32));
         W32(out + 32, (uint32_t)st.st_size);
         snprintf((char *)HP(out + 44), 260, "%s", e->d_name);
@@ -974,16 +1030,16 @@ W(GetFullPathNameA) {
     RET(4, strlen(full));
 }
 
-/* Drives: a single hard disk, C:, holding the game. */
-W(GetLogicalDrives) { RET(0, 1u << 2); }
+/* Drives: C: is the game's hard disk. D: is a CD-ROM holding the game disc, so disc checks pass. */
+W(GetLogicalDrives) { RET(0, (1u << 2) | (1u << 3)); }
 W(GetLogicalDriveStringsA) {
-    const char s[] = "C:\\\0";
+    const char s[] = "C:\\\0D:\\\0";
     if (ARG(0) >= sizeof s) memcpy(HP(ARG(1)), s, sizeof s);
     RET(2, sizeof s - 1);
 }
 W(GetDriveTypeA) {
     const char *r = ARG(0) ? GSTR(ARG(0)) : "C:\\";
-    RET(1, (r[0] == 'C' || r[0] == 'c') ? 3 /* DRIVE_FIXED */ : 1 /* DRIVE_NO_ROOT_DIR */);
+    RET(1, (r[0] == 'D' || r[0] == 'd') ? 5 /* DRIVE_CDROM */ : 3 /* DRIVE_FIXED */);
 }
 W(GetDiskFreeSpaceA) {
     if (ARG(1)) W32(ARG(1), 8);
@@ -994,13 +1050,13 @@ W(GetDiskFreeSpaceA) {
 }
 W(GetVolumeInformationA) {
     const char *r = ARG(0) ? GSTR(ARG(0)) : "C:\\";
+    const char *label = (r[0] == 'D' || r[0] == 'd') ? "CRICKET07" : "SYSTEM";
     LOG("[file] GetVolumeInformationA(%s)\n", r);
-    if (r[0] != 'C' && r[0] != 'c') { RET(8, 0); }
-    if (ARG(1)) snprintf((char *)HP(ARG(1)), ARG(2), "%s", "SYSTEM");
-    if (ARG(3)) W32(ARG(3), 0x1234ABCD);
+    if (ARG(1)) snprintf((char *)HP(ARG(1)), ARG(2), "%s", label);
+    if (ARG(3)) W32(ARG(3), 0x07C07C07);
     if (ARG(4)) W32(ARG(4), 255);
     if (ARG(5)) W32(ARG(5), 0);
-    if (ARG(6)) snprintf((char *)HP(ARG(6)), ARG(7), "%s", "NTFS");
+    if (ARG(6)) snprintf((char *)HP(ARG(6)), ARG(7), "%s", (r[0] == 'D' || r[0] == 'd') ? "CDFS" : "NTFS");
     RET(8, 1);
 }
 
@@ -1011,12 +1067,35 @@ W(CreateFileMappingA) {
     m->fd = f ? dup(f->fd) : -1;
     RET(6, h);
 }
+/* The game's .big archives (data.gob is 325 MB) map lazily, as Windows would page them in (core.c): for a read-only
+   view of a whole archive, the bytes to read now (its header and directory, up to the first file: big-endian at
+   +12); the files' bytes are read as the game copies them out. 0: copy the view in whole (anything else, or
+   RC_EAGER_VIEWS=1 for comparisons). */
+static uint32_t lazy_view_eager_bytes(int fd, uint32_t access, uint32_t off, uint32_t len) {
+#ifndef PROFILE_LAZY_VIEWS
+    return 0;   /* lazy views need the game's memcpy hook (profiles/cricket07.patches.json) */
+#endif
+    static int eager_views = -1;
+    if (eager_views < 0) eager_views = getenv("RC_EAGER_VIEWS") != NULL;
+    uint8_t h[16];
+    if (eager_views || (access & 2 /* FILE_MAP_WRITE */) || off || len < (4u << 20) || pread(fd, h, 16, 0) != 16 ||
+        memcmp(h, "BIG", 3))
+        return 0;
+    uint32_t dir_end = (uint32_t)h[12] << 24 | h[13] << 16 | h[14] << 8 | h[15];
+    return dir_end && dir_end < len ? dir_end : 0;
+}
 W(MapViewOfFile) {
     WinHandle *m = handle_get(ARG(0), H_MAPPING);
     if (!m || m->fd < 0) RET(5, 0);
     struct stat st;
     fstat(m->fd, &st);
     uint32_t off = ARG(3), len = ARG(4) ? ARG(4) : (uint32_t)st.st_size - off;
+    uint32_t eager = lazy_view_eager_bytes(m->fd, ARG(1), off, len);
+    if (eager) {
+        uint32_t a = guest_view_map(m->fd, len, eager);
+        LOG("[file] MapViewOfFile(%u bytes, lazy, %u read now) -> %08x\n", len, eager, a);
+        if (a) RET(5, a);
+    }
     uint32_t a = guest_valloc(len);
     /* copy-in (views are only read by the game); loop: a single read may come back short */
     uint32_t got = 0;
@@ -1028,7 +1107,12 @@ W(MapViewOfFile) {
     LOG("[file] MapViewOfFile(%u bytes, read %u) -> %08x\n", len, got, a);
     RET(5, a);
 }
-W(UnmapViewOfFile) { RET(1, 1); }
+W(UnmapViewOfFile) {
+    guest_view_unmap(ARG(0));
+    uint32_t freed = guest_vfree(ARG(0));
+    LOG("[file] UnmapViewOfFile(%08x) released %u bytes\n", ARG(0), freed);
+    RET(1, freed != 0);
+}
 
 /* ------------------------------------------------------------------ resources (none exposed yet) */
 

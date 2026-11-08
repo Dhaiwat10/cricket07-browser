@@ -53,6 +53,7 @@ typedef struct Shader {
     uint32_t *decl;  uint32_t decl_len;   /* vertex shaders: declaration tokens */
     uint32_t *code;  uint32_t code_len;   /* NULL for fixed-function declarations */
     void *backend;
+    void *gpu;                            /* vertex shaders: the recorder's GPU program (render_rec.c) */
 } Shader;
 
 #define MAX_TS 512
@@ -78,6 +79,7 @@ typedef struct DevState {
 typedef struct Device {
     DevState st;
     uint32_t width, height, backbuffer_format, depth_format, windowed, hwnd;
+    uint32_t msaa;                /* back buffer samples: 1, or 4 when the game asked for anti-aliasing */
     uint32_t backbuffer, depth;   /* guest surface objects */
     uint32_t d3d;                 /* owning IDirect3D8 */
     uint32_t frame;

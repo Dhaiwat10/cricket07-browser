@@ -92,15 +92,238 @@ uint32_t heap_realloc(uint32_t a, uint32_t size, int zero) {
 #define VALLOC_LO GUEST_VALLOC_LO
 #define VALLOC_HI GUEST_VALLOC_HI
 static uint32_t g_valloc_top = VALLOC_LO;
+static uint32_t g_valloc_hwm = VALLOC_LO;   /* above this, the range was never handed out, so it is still zero */
 
-uint32_t guest_valloc(uint32_t size) {
+/* Regions handed out (so a release knows the size) and released regions, kept sorted and merged so a
+   released file view or VirtualAlloc region can be handed out again: the game maps its 64 MB motion
+   archive at every match start and unmaps it at the end, and the browser build only has 768 MB. */
+typedef struct { uint32_t addr, size; } VRegion;
+static VRegion *g_vused, *g_vfree;
+static uint32_t g_nvused, g_capvused, g_nvfree, g_capvfree;
+
+static void vregion_add(VRegion **v, uint32_t *n, uint32_t *cap, uint32_t at, VRegion r) {
+    if (*n == *cap) { *cap = *cap ? *cap * 2 : 64; *v = realloc(*v, *cap * sizeof **v); }
+    memmove(*v + at + 1, *v + at, (*n - at) * sizeof **v);
+    (*v)[at] = r;
+    (*n)++;
+}
+static void vregion_del(VRegion *v, uint32_t *n, uint32_t at) {
+    memmove(v + at, v + at + 1, (*n - at - 1) * sizeof *v);
+    (*n)--;
+}
+
+static uint32_t region_alloc(uint32_t size, int zero) {
     size = (size + 0xffff) & ~0xffffu;  /* Windows allocation granularity */
+    if (!size) size = 0x10000;
     pthread_mutex_lock(&g_heap_lock);
-    uint32_t a = g_valloc_top;
-    if (a + size > VALLOC_HI) { pthread_mutex_unlock(&g_heap_lock); return 0; }
-    g_valloc_top += size;
+    uint32_t a = 0;
+    for (uint32_t i = 0; i < g_nvfree; i++)   /* first fit among released regions (sorted by address) */
+        if (g_vfree[i].size >= size) {
+            a = g_vfree[i].addr;
+            if (g_vfree[i].size == size) vregion_del(g_vfree, &g_nvfree, i);
+            else { g_vfree[i].addr += size; g_vfree[i].size -= size; }
+            break;
+        }
+    if (!a) {
+        if (g_valloc_top + size > VALLOC_HI) { pthread_mutex_unlock(&g_heap_lock); return 0; }
+        a = g_valloc_top;
+        g_valloc_top += size;
+        /* a region given back at the top holds what it held; beyond the high-water mark it's fresh, still zero
+           (and not yet resident in the browser, which a memset would change) */
+        if (zero && a < g_valloc_hwm) memset(HP(a), 0, g_valloc_hwm - a < size ? g_valloc_hwm - a : size);
+        if (g_valloc_top > g_valloc_hwm) g_valloc_hwm = g_valloc_top;
+    } else if (zero) memset(HP(a), 0, size);   /* Windows hands out zeroed pages */
+    uint32_t i = 0;
+    while (i < g_nvused && g_vused[i].addr < a) i++;
+    vregion_add(&g_vused, &g_nvused, &g_capvused, i, (VRegion){ a, size });
     pthread_mutex_unlock(&g_heap_lock);
-    return a;  /* never handed out before, so still zero */
+    return a;
+}
+
+uint32_t guest_valloc(uint32_t size) { return region_alloc(size, 1); }
+
+/* Releases a region guest_valloc returned; 0 (and no change) when `a` isn't the start of one. */
+uint32_t guest_vfree(uint32_t a) {
+    pthread_mutex_lock(&g_heap_lock);
+    uint32_t lo = 0, hi = g_nvused;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (g_vused[m].addr < a) lo = m + 1; else hi = m; }
+    if (lo >= g_nvused || g_vused[lo].addr != a) { pthread_mutex_unlock(&g_heap_lock); return 0; }
+    uint32_t size = g_vused[lo].size;
+    vregion_del(g_vused, &g_nvused, lo);
+    uint32_t i = 0;
+    while (i < g_nvfree && g_vfree[i].addr < a) i++;
+    vregion_add(&g_vfree, &g_nvfree, &g_capvfree, i, (VRegion){ a, size });
+    if (i + 1 < g_nvfree && g_vfree[i].addr + g_vfree[i].size == g_vfree[i + 1].addr) {   /* merge with the next */
+        g_vfree[i].size += g_vfree[i + 1].size;
+        vregion_del(g_vfree, &g_nvfree, i + 1);
+    }
+    if (i > 0 && g_vfree[i - 1].addr + g_vfree[i - 1].size == a) {   /* and with the previous */
+        g_vfree[i - 1].size += g_vfree[i].size;
+        vregion_del(g_vfree, &g_nvfree, i);
+        i--;
+    }
+    if (g_vfree[i].addr + g_vfree[i].size == g_valloc_top) {   /* top of the range: give it back */
+        g_valloc_top = g_vfree[i].addr;
+        vregion_del(g_vfree, &g_nvfree, i);
+    }
+    pthread_mutex_unlock(&g_heap_lock);
+    return size;
+}
+
+/* ------------------------------------------------------------------ lazy file views
+ * The game maps its .big archives whole with MapViewOfFile (data.gob alone is 325 MB, about 575 MB in all by the
+ * first match) but reads only a few percent of them: about 30 MB into a match. Copied in whole, they were most
+ * of the browser build's memory, and iPhones killed the tab. A lazy view reads the archive's header and
+ * directory (which the game parses in place) at once, and any other 64 KB chunk when it is first copied out:
+ * the game reads every file from an archive with its memcpy, whose entry hook (profiles/cricket07.patches.json) lands here.
+ * Natively, RC_VIEW_CHECK=1 keeps unread chunks inaccessible, so a read that skipped the hook crashes at once.
+ */
+#define VIEW_CHUNK 0x10000u
+#define VIEW_MAX_CHUNKS 0x10000u   /* a 4 GB view */
+#define MAX_VIEWS 16
+/* A slot's lock and bitmap last as long as the program, so a copy that races an unmap never touches freed memory,
+   and a read checks under the lock that its view is still mapped before it writes into the region. */
+typedef struct { pthread_mutex_t lock; uint32_t a, len; int fd; uint8_t filled[VIEW_MAX_CHUNKS / 8]; } LazyView;
+static LazyView g_views[MAX_VIEWS];
+static int g_nviews;   /* slots ever used; a released slot has len 0 */
+static pthread_mutex_t g_view_lock = PTHREAD_MUTEX_INITIALIZER;   /* picking, mapping and releasing slots */
+static int g_view_check;
+
+#ifndef __EMSCRIPTEN__
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+static void view_protect(uint32_t a, uint32_t len, int prot) { mprotect(HP(a), (len + 0x3fff) & ~0x3fffu, prot); }
+static void view_check_fault(int sig, siginfo_t *si, void *uc) {
+    uintptr_t p = (uintptr_t)si->si_addr;
+    Dl_info di = { 0 };
+    dladdr((void *)((ucontext_t *)uc)->uc_mcontext->__ss.__pc, &di);
+    for (int i = 0; i < g_nviews; i++)
+        if (g_views[i].len && p >= (uintptr_t)HP(g_views[i].a) && p < (uintptr_t)HP(g_views[i].a) + g_views[i].len) {
+            fprintf(stderr, "[view] read of an unfilled chunk of the view at %08x (+%lx) outside the memcpy hook, in %s\n",
+                    g_views[i].a, (unsigned long)(p - (uintptr_t)HP(g_views[i].a)), di.dli_sname ? di.dli_sname : "?");
+            break;
+        }
+    signal(sig, SIG_DFL);
+}
+#else
+static void view_protect(uint32_t a, uint32_t len, int prot) { (void)a; (void)len; (void)prot; }
+#endif
+
+static int chunk_filled(LazyView *v, uint32_t k) {
+    return __atomic_load_n(&v->filled[k >> 3], __ATOMIC_ACQUIRE) & (1u << (k & 7));
+}
+
+/* Reads chunks k0..k1 (none of them filled yet) in one go, with v->lock held. A chunk counts as filled only once
+   all of it has been read; after a failed or short read the rest stay unfilled, and the next copy tries again. */
+static void view_read_run(LazyView *v, uint32_t k0, uint32_t k1) {
+    uint64_t run_end = (uint64_t)(k1 + 1) * VIEW_CHUNK;
+    uint32_t at = k0 * VIEW_CHUNK, end = run_end < v->len ? (uint32_t)run_end : v->len, got = 0;
+    if (g_view_check) view_protect(v->a + at, end - at, 3 /* PROT_READ | PROT_WRITE */);
+    while (at + got < end) {
+        ssize_t r = pread(v->fd, HP(v->a + at + got), end - at - got, (off_t)at + got);
+        if (r <= 0) break;
+        got += (uint32_t)r;
+    }
+    if (at + got < end)
+        fprintf(stderr, "[view] read %u of %u bytes at +%x of the view at %08x\n", got, end - at, at, v->a);
+    LOG("[view] %08x: read %u KB at +%x\n", v->a, got >> 10, at);
+    for (uint32_t k = k0; k <= k1; k++) {
+        uint64_t k_end = (uint64_t)(k + 1) * VIEW_CHUNK < v->len ? (uint64_t)(k + 1) * VIEW_CHUNK : v->len;
+        if (k_end > (uint64_t)at + got) break;
+        __atomic_or_fetch(&v->filled[k >> 3], (uint8_t)(1u << (k & 7)), __ATOMIC_RELEASE);
+    }
+}
+
+static void view_fill(uint32_t src, uint32_t n) {
+    if (!n) return;
+    int nv = __atomic_load_n(&g_nviews, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nv; i++) {
+        LazyView *v = &g_views[i];
+        uint32_t len = __atomic_load_n(&v->len, __ATOMIC_ACQUIRE), a = v->a;
+        if (!len || src >= a + len || src + n <= a) continue;
+        uint32_t lo = src > a ? src - a : 0, hi = src + n - a < len ? src + n - a : len;
+        uint32_t k1 = (hi - 1) / VIEW_CHUNK;
+        for (uint32_t k = lo / VIEW_CHUNK; k <= k1; k++) {
+            if (chunk_filled(v, k)) continue;
+            pthread_mutex_lock(&v->lock);
+            if (v->len == len && v->a == a)   /* still this view: read each run of chunks still unfilled */
+                for (uint32_t s = k; s <= k1; s++) {
+                    if (chunk_filled(v, s)) continue;
+                    uint32_t e = s;
+                    while (e < k1 && !chunk_filled(v, e + 1)) e++;
+                    view_read_run(v, s, e);
+                    s = e;
+                }
+            pthread_mutex_unlock(&v->lock);
+            break;
+        }
+    }
+}
+
+/* A lazy view of `len` bytes of the open file `fd` from its start, whose first `eager` bytes are read now; 0 when
+   there is no free slot or address space. */
+uint32_t guest_view_map(int fd, uint32_t len, uint32_t eager) {
+    static int init;
+    pthread_mutex_lock(&g_view_lock);
+    if (!init) {
+        init = 1;
+#ifndef __EMSCRIPTEN__
+        if ((g_view_check = getenv("RC_VIEW_CHECK") != NULL)) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = view_check_fault;
+            sa.sa_flags = SA_SIGINFO;
+            sigaction(SIGSEGV, &sa, NULL);
+            sigaction(SIGBUS, &sa, NULL);
+        }
+#endif
+        g_copy_source_hook = view_fill;
+    }
+    int i = 0;
+    while (i < g_nviews && g_views[i].len) i++;
+    uint32_t a = i < MAX_VIEWS ? region_alloc(len, 0) : 0;   /* not zeroed: no byte is read before its chunk is filled */
+    if (!a) { pthread_mutex_unlock(&g_view_lock); return 0; }
+    LazyView *v = &g_views[i];
+    if (i == g_nviews) pthread_mutex_init(&v->lock, NULL);
+    pthread_mutex_lock(&v->lock);
+    memset(v->filled, 0, (len - 1) / VIEW_CHUNK / 8 + 1);
+    v->a = a;
+    v->fd = dup(fd);
+    if (g_view_check) view_protect(a, len, 0 /* PROT_NONE */);
+    __atomic_store_n(&v->len, len, __ATOMIC_RELEASE);
+    if (eager) view_read_run(v, 0, ((eager < len ? eager : len) - 1) / VIEW_CHUNK);
+    pthread_mutex_unlock(&v->lock);
+    if (i == g_nviews) __atomic_store_n(&g_nviews, i + 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_view_lock);
+    return a;
+}
+
+/* The end of the lazy view holding `a`, or 0: memory sweeps (RC_HASH_ALL) skip views, read-only file data that
+   is only partly read in. */
+uint32_t guest_view_end(uint32_t a) {
+    for (int i = 0; i < g_nviews; i++)
+        if (g_views[i].len && a >= g_views[i].a && a - g_views[i].a < g_views[i].len)
+            return (g_views[i].a + g_views[i].len + 0xffff) & ~0xffffu;   /* its whole region */
+    return 0;
+}
+
+/* Forgets the lazy view at `a` (before its range is released); 0 when there is none. */
+int guest_view_unmap(uint32_t a) {
+    pthread_mutex_lock(&g_view_lock);
+    int found = 0;
+    for (int i = 0; i < g_nviews; i++)
+        if (g_views[i].len && g_views[i].a == a) {
+            pthread_mutex_lock(&g_views[i].lock);   /* waits out a read into the region */
+            if (g_view_check) view_protect(a, g_views[i].len, 3);
+            __atomic_store_n(&g_views[i].len, 0, __ATOMIC_RELEASE);
+            close(g_views[i].fd);
+            pthread_mutex_unlock(&g_views[i].lock);
+            found = 1;
+        }
+    pthread_mutex_unlock(&g_view_lock);
+    return found;
 }
 
 void guest_mem_ranges(uint32_t r[4]) { r[0] = HEAP_LO; r[1] = g_heap_top; r[2] = VALLOC_LO; r[3] = g_valloc_top; }
@@ -233,10 +456,33 @@ int map_path(const char *guest, char *host, size_t n) {
 
 /* ------------------------------------------------------------------ time */
 
+/* In WebAssembly the clocks come from JavaScript, and every call of libc's clock_gettime crosses into JS with
+   64-bit arguments and results, which the engine boxes as BigInt objects: two heap allocations per read. The
+   game reads the clock millions of times while it boots (its movie player spins on the time until the next
+   frame is due), and in Safari that garbage stayed resident for the life of the page: ~500 MB more than the
+   same game under Chrome, enough to push an iPhone's web content process over its 2 GB limit (jetsam kill a
+   few seconds after Play). emscripten_get_now / emscripten_date_now return a double and allocate nothing. */
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#include <emscripten/html5.h>   /* emscripten_date_now */
+static double wall_ms(void) { return emscripten_date_now(); }
+static double mono_s(void) { return emscripten_get_now() * 1e-3; }
+#else
+static double wall_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+static double mono_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + ts.tv_nsec * 1e-9; }
+#endif
+
 uint64_t host_time_100ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ((uint64_t)ts.tv_sec + 11644473600ull) * 10000000ull + (uint64_t)ts.tv_nsec / 100;
+    return (uint64_t)(wall_ms() * 10000.0) + 11644473600ull * 10000000ull;
+}
+
+/* The wall clock as a timespec, for pthread_cond_timedwait deadlines (CLOCK_REALTIME). */
+void host_realtime(struct timespec *ts) {
+    double ms = wall_ms();
+    ts->tv_sec = (time_t)(ms / 1000.0);
+    ts->tv_nsec = (long)((ms - (double)ts->tv_sec * 1000.0) * 1e6);
+    if (ts->tv_nsec < 0) ts->tv_nsec = 0;
+    if (ts->tv_nsec >= 1000000000L) ts->tv_nsec = 999999999L;
 }
 
 /* Seconds since the process started, plus a minute: like uptime on a freshly booted PC. Games turn
@@ -244,9 +490,7 @@ uint64_t host_time_100ns(void) {
    is epoch-based in WebAssembly (~1.8e12 ms) and broke games' timer scheduling there. */
 double host_seconds(void) {
     static double start = -1;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    double now = mono_s();
     if (start < 0) start = now;   /* first call happens during startup, before other threads exist */
     return now - start + 60.0;
 }
@@ -264,6 +508,18 @@ static GuestThread g_main_thread;
 int deterministic(void) {
     if (g_det < 0) g_det = getenv("RC_DETERMINISTIC") != NULL;
     return g_det;
+}
+/* The refresh rate Present is paced to: the virtual vsync in deterministic mode, headless pacing and
+   RC_PACE60. RC_REFRESH_HZ=144 runs the game at 144 frames per second. Netplay stays on 60 Hz frames. */
+int refresh_hz(void) {
+    static int hz;
+    if (!hz) {
+        const char *e = getenv("RC_REFRESH_HZ");
+        hz = e ? atoi(e) : 60;
+        if (hz < 30) hz = 30;
+        if (hz > 1000) hz = 1000;
+    }
+    return hz;
 }
 int on_game_thread(void) { return t_self == &g_main_thread; }
 
@@ -296,8 +552,9 @@ void vclock_frame(void) {
         sched_wait(NULL, NULL, boundary, NULL);
         return;
     }
-    uint64_t k = now * 60ull / 1000000ull + 1;
-    sched_wait(NULL, NULL, (k * 1000000ull + 59ull) / 60ull, NULL);
+    uint64_t hz = (uint64_t)refresh_hz();
+    uint64_t k = now * hz / 1000000ull + 1;
+    sched_wait(NULL, NULL, (k * 1000000ull + hz - 1) / hz, NULL);
 }
 static uint64_t vclock_rdtsc(void) { return (uint64_t)(guest_seconds() * 2e9); }   /* 2 GHz, as the registry says */
 /* A thread preempted after a full quantum has used CPU time, so the clock moves on by RC_DET_PREEMPT_US
