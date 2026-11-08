@@ -371,7 +371,11 @@ WinHandle *handle_get(uint32_t h, int type) {
 void handle_close(uint32_t h) {
     WinHandle *x = handle_get(h, -1);
     if (!x) return;
-    if (x->type == H_FILE && x->fd >= 0) close(x->fd);
+    /* A mapping holds its own dup of the file (CreateFileMappingA), released with it as on Windows. Left open, the
+       browser's file system keeps the file locked (OPFS refuses removeEntry/move on an open file), so a later
+       DeleteFileA/MoveFileA of it fails there, though not natively, and a save that replaces it is lost. Lazy views
+       keep their own dup (guest_view_map); copy-in views no longer need the file. */
+    if ((x->type == H_FILE || x->type == H_MAPPING) && x->fd >= 0) close(x->fd);
     if (x->type == H_FIND && x->ptr) free(x->ptr);
     x->type = H_FREE;
 }
