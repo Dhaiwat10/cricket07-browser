@@ -11,6 +11,14 @@ ALLOWED_ORIGINS = "*"   # comma-separated origins allowed to fetch tickets, e.g.
 name = "ROOMS"
 class_name = "NetplayRoom"
 
+[[durable_objects.bindings]]
+name = "MATCH"
+class_name = "Matchmaker"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NetplayRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Matchmaker"]
